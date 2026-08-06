@@ -1,4 +1,4 @@
-//========= Copyright © 1996-2005, Valve Corporation, All rights reserved. ============//
+//========= Copyright Â© 1996-2005, Valve Corporation, All rights reserved. ============//
 //
 // Purpose:
 //
@@ -1439,7 +1439,7 @@ static void WriteStats( bool skipWarnings )
 
 static constexpr const char* const validTypes[] =
 {
-	"vs", "ps", "gs", "ds", "hs"
+	"vs", "ps", "gs", "ds", "hs", "cs"
 };
 
 static constexpr const char* const validModels[] =
