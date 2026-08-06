@@ -43,13 +43,13 @@ namespace r
 	static const RE2 inc( R"reg(#\s*include\s*"(.*)")reg" );
 	static const RE2 xbox_reg( R"reg(\[XBOX\])reg" );
 	static const RE2 pc_reg( R"reg(\[PC\])reg" );
-	static const RE2 start( R"reg(^\s*//\s*(STATIC|DYNAMIC|SKIP|CENTROID|[VPGDH]S_MAIN)\s*:\s*(.*)$)reg" );
+	static const RE2 start( R"reg(^\s*//\s*(STATIC|DYNAMIC|SKIP|CENTROID|[VPGDHC]S_MAIN)\s*:\s*(.*)$)reg" );
 	static const RE2 init( R"reg(\[\s*=\s*([^\]]+)\])reg" );
 	static const RE2 static_combo( R"reg(^\s*//\s*STATIC\s*:\s*"(.*)"\s+"(\d+)\.\.(\d+)".*)reg" );
 	static const RE2 dynamic_combo( R"reg(^\s*//\s*DYNAMIC\s*:\s*"(.*)"\s+"(\d+)\.\.(\d+)".*)reg" );
 	static const RE2 centroid( R"reg(^\s*//\s*CENTROID\s*:\s*TEXCOORD(\d+).*$)reg" );
-	static const RE2 base_name( R"reg(^(.*)_[vpgdh]s(\d\db|\d\d|\dx|xx))reg" );
-	static const RE2 target( R"reg(^.*_([vpgdh]s)(\d\db|\d\d|\dx|xx))reg" );
+	static const RE2 base_name( R"reg(^(.*)_[vpgdhc]s(\d\db|\d\d|\dx|xx))reg" );
+	static const RE2 target( R"reg(^.*_([vpgdhc]s)(\d\db|\d\d|\dx|xx))reg" );
 	static const RE2 c_comment_start( R"reg(^(.*)\/\*)reg");
 	static const RE2 c_comment_end( R"reg(\*\/(.*)$)reg");
 	static const RE2 c_inline_comment( R"reg(^(.*)\/\*.*?\*\/(.*))reg");
@@ -180,8 +180,8 @@ static bool ReadFile( const fs::path& name, const std::string& srcPath, const st
 	return !cComment;
 }
 
-static constexpr const char validL[] = { 'v', 'p', 'g', 'h', 'd' };
-static constexpr const char validU[] = { 'V', 'P', 'G', 'H', 'D' };
+static constexpr const char validL[] = { 'v', 'p', 'g', 'h', 'd', 'c' };
+static constexpr const char validU[] = { 'V', 'P', 'G', 'H', 'D', 'C' };
 bool Parser::ParseFile( const fs::path& name, const std::string& root, const std::vector<fs::path>& includePaths, const std::string_view& target, const std::string_view& version, CfgProcessor::ShaderConfig& conf )
 {
 	using re2::RE2;
@@ -189,11 +189,11 @@ bool Parser::ParseFile( const fs::path& name, const std::string& root, const std
 	const auto nameS = name.string();
 	const auto f = nameS.find_last_of( '.' );
 	char regMatch[] = { R"reg(\[ s(\d+\w?)\])reg" };
-	char regNotMatch[] = { R"reg(\[[    ]s\d+\w?\])reg" };
+	char regNotMatch[] = { R"reg(\[[     ]s\d+\w?\])reg" };
 	std::string mainCat = " S_MAIN"s;
 
 	regMatch[2] = target[0];
-	for ( int i = 0, j = 0; i < 5; ++i )
+	for ( int i = 0, j = 0; i < 6; ++i )
 		if ( validL[i] != target[0] )
 			regNotMatch[3 + j++] = validL[i];
 	mainCat[0] = toupper( target[0] );
