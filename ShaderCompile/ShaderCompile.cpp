@@ -702,8 +702,8 @@ static void WriteShaderFiles( std::string_view pShaderName )
 
 	StaticComboHeaders.reserve( 1ULL + pByteCodeArray->size() ); // we know how much ram we need
 
-	constexpr size_t STATIC_COMBO_HASH_SIZE = 73;
-	std::vector<size_t> comboIndicesHashedByCRC32[STATIC_COMBO_HASH_SIZE];
+	std::unordered_multimap<uint32_t, size_t> comboIndicesHashedByCRC32;
+	comboIndicesHashedByCRC32.reserve( pByteCodeArray->size() );
 	std::vector<StaticComboAliasRecord_t> duplicateCombos;
 
 	// Reproduce the legacy CUtlNodeHash traversal: buckets are visited in order,
@@ -739,14 +739,13 @@ static void WriteShaderFiles( std::string_view pShaderName )
 			};
 
 			// now, see if we have an identical static combo
-			const uint32_t nHashIdx = hdr.m_nCRC32 % STATIC_COMBO_HASH_SIZE;
-			const auto& hash = comboIndicesHashedByCRC32[nHashIdx];
+			const auto [first, last] = comboIndicesHashedByCRC32.equal_range( hdr.m_nCRC32 );
 			bool bIsDuplicate = false;
-			for ( const size_t i : hash )
+			for ( auto candidate = first; candidate != last; ++candidate )
 			{
-				const StaticComboAuxInfo_t& check = StaticComboHeaders[i];
+				const StaticComboAuxInfo_t& check = StaticComboHeaders[candidate->second];
 				const CStaticCombo::PackedCode& checkCode = check.m_pByteCode->Code();
-				if ( check.m_nCRC32 == hdr.m_nCRC32 && checkCode.GetLength() == code.GetLength() && memcmp( checkCode.GetData(), code.GetData(), checkCode.GetLength() ) == 0 )
+				if ( checkCode.GetLength() == code.GetLength() && memcmp( checkCode.GetData(), code.GetData(), checkCode.GetLength() ) == 0 )
 				{
 					// this static combo is the same as another one!!
 					duplicateCombos.emplace_back( StaticComboAliasRecord_t { hdr.m_nStaticComboID, check.m_nStaticComboID } );
@@ -758,7 +757,7 @@ static void WriteShaderFiles( std::string_view pShaderName )
 			if ( !bIsDuplicate )
 			{
 				StaticComboHeaders.emplace_back( std::move( hdr ) );
-				comboIndicesHashedByCRC32[nHashIdx].push_back( StaticComboHeaders.size() - 1 );
+				comboIndicesHashedByCRC32.emplace( hdr.m_nCRC32, StaticComboHeaders.size() - 1 );
 			}
 		}
 	}
@@ -890,34 +889,10 @@ static size_t AssembleWorkerReplyPackage( const CfgProcessor::CfgEntryInfo* pEnt
 		FlushCombos( nBytesWritten, ubDynamicComboBuffer, pBuf );
 	}
 
-	static Clock::time_point lastInfoTime;
-	static uint64_t packedCount = 0;
-	static std::string_view lastShader;
-	const Clock::time_point now = Clock::now();
 	{
 		std::lock_guard lock{ Threading::g_mtxGlobal };
 		if ( pStComboRec )
 			pByteCodeArray->erase( nComboOfEntry );
-		if ( lastShader != pEntry->m_szName )
-		{
-			packedCount = g_RestoredStaticCombos.size();
-			lastShader = pEntry->m_szName;
-		}
-		++packedCount;
-		if ( now - lastInfoTime >= chrono::seconds( 1 ) )
-		{
-			const uint64_t totalCombos = pEntry->m_numStaticCombos;
-			const uint64_t remaining = totalCombos > packedCount ? totalCombos - packedCount : 0;
-			std::cout << "\r"sv << clr::escaped( lineRewind ) << "Compiling "sv
-				<< ( g_ShaderHadError.contains( pEntry->m_szName ) ? clr::red : clr::green ) << pEntry->m_szName << clr::reset
-				<< " ["sv << clr::blue << FormatComboProgress( packedCount, totalCombos ) << clr::reset << "] "sv
-				<< clr::blue << PrettyPrint( packedCount ) << clr::reset << "/"sv
-				<< clr::blue << PrettyPrint( totalCombos ) << clr::reset << " combos, "sv
-				<< clr::blue << PrettyPrint( remaining ) << clr::reset << " remaining] "sv
-				<< FormatTimeShort( duration_cast<chrono::seconds>( now - g_flStartTime ).count() ) << " elapsed"sv
-				<< std::flush;
-			lastInfoTime = now;
-		}
 	}
 
 	return nBytesWritten;
@@ -935,6 +910,8 @@ public:
 	{
 		m_pEntry = entry;
 		m_iNextStatic = 0;
+		m_iCompletedStatic = 0;
+		m_StartTime = m_LastInfoTime = Clock::now();
 		m_bBreak.store( false, std::memory_order_release );
 	}
 
@@ -976,7 +953,9 @@ public:
 				}
 				const uint64_t begin = m_pEntry->m_iCommandStart + first * m_pEntry->m_numDynamicCombos;
 				const uint64_t end = begin + count * m_pEntry->m_numDynamicCombos;
-				ProcessTask( begin, end, combo );
+				const uint64_t skipped = ProcessTask( begin, end, combo );
+				if ( !Stopped() )
+					ReportProgress( count + skipped );
 			}
 		}
 		catch ( const std::exception& error )
@@ -1000,12 +979,14 @@ public:
 	}
 
 private:
-	// Bound the tail of a task while amortizing scheduling over whole static combos.
-	static constexpr uint64_t StaticCombosPerTask = 256;
+	// Keep expensive static combos independently schedulable.
+	static constexpr uint64_t StaticCombosPerTask = 1;
 	std::atomic<bool> m_bBreak{ false };
 	TMutexType m_Mutex;
 	const CfgProcessor::CfgEntryInfo* m_pEntry = nullptr;
 	uint64_t m_iNextStatic = 0;
+	uint64_t m_iCompletedStatic = 0;
+	Clock::time_point m_StartTime, m_LastInfoTime;
 	const uint32_t m_iFlags;
 
 	bool Stopped() const noexcept
@@ -1013,7 +994,7 @@ private:
 		return m_bBreak.load( std::memory_order_acquire ) || g_bInterrupted.load();
 	}
 
-	void ProcessTask( uint64_t begin, uint64_t end, CfgProcessor::ComboHandle& combo )
+	uint64_t ProcessTask( uint64_t begin, uint64_t end, CfgProcessor::ComboHandle& combo )
 	{
 		bool haveCombo = CfgProcessor::Combo_Seek( begin, combo, end );
 		if ( !haveCombo )
@@ -1022,10 +1003,11 @@ private:
 			std::lock_guard lock{ m_Mutex };
 			const uint64_t next = m_pEntry->m_iCommandStart + m_iNextStatic * m_pEntry->m_numDynamicCombos;
 			// A true predicate may cover many still-unassigned tasks. Skip only complete statics.
+			const uint64_t previous = m_iNextStatic;
 			if ( skippedEnd > next )
 				m_iNextStatic = std::min( m_pEntry->m_numStaticCombos,
 					( skippedEnd - m_pEntry->m_iCommandStart ) / m_pEntry->m_numDynamicCombos );
-			return;
+			return m_iNextStatic - previous;
 		}
 		std::unique_ptr<CStaticCombo> current;
 		bool failed = false;
@@ -1055,6 +1037,28 @@ private:
 		// Interrupted static combos are discarded rather than checkpointing partial data.
 		if ( !Stopped() )
 			PackageData( current, failed );
+		return 0;
+	}
+
+	void ReportProgress( uint64_t completed )
+	{
+		std::lock_guard lock{ m_Mutex };
+		const uint64_t total = m_pEntry->m_numStaticCombos;
+		Assert( completed <= total - m_iCompletedStatic );
+		m_iCompletedStatic += completed;
+		const Clock::time_point now = Clock::now();
+		if ( now - m_LastInfoTime < chrono::seconds( 1 ) && m_iCompletedStatic != total )
+			return;
+		std::lock_guard outputLock{ Threading::g_mtxGlobal };
+		std::cout << "\r"sv << clr::escaped( lineRewind ) << "Compiling "sv
+			<< ( g_ShaderHadError.contains( m_pEntry->m_szName ) ? clr::red : clr::green ) << m_pEntry->m_szName << clr::reset
+			<< " ["sv << clr::blue << FormatComboProgress( m_iCompletedStatic, total ) << clr::reset << "] "sv
+			<< clr::blue << PrettyPrint( m_iCompletedStatic ) << clr::reset << "/"sv
+			<< clr::blue << PrettyPrint( total ) << clr::reset << " static combos processed (including SKIP), "sv
+			<< clr::blue << PrettyPrint( total - m_iCompletedStatic ) << clr::reset << " remaining, "sv
+			<< FormatTimeShort( duration_cast<chrono::seconds>( now - m_StartTime ).count() ) << " shader elapsed"sv
+			<< std::flush;
+		m_LastInfoTime = now;
 	}
 
 	void ExecuteCompileCommand( CfgProcessor::ComboHandle combo, CStaticCombo& current, bool& failed )
@@ -1660,6 +1664,7 @@ int main( int argc, const char* argv[] )
 	}
 
 	cmdLine.add( "", false, 0, 0, "Disable static-combo checkpoint and recovery", "-noresume", "/noresume" );
+	cmdLine.add( "", false, 0, 0, "Enable adaptive reuse of identical preprocessed shaders (default)", "-preprocess-cache" );
 	cmdLine.add( "", false, 0, 0, "Disable reuse of identical preprocessed shaders", "-no-preprocess-cache" );
 	cmdLine.parse( argc, argv );
 	Compiler::SetPreprocessCacheEnabled( !cmdLine.isSet( "-no-preprocess-cache" ) );

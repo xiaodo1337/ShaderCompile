@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include "shader_vcs_version.h"
 
 namespace LZMA
 {
@@ -37,6 +38,8 @@ namespace LZMA
 			{
 				CLzmaEncProps props;
 				LzmaEncProps_Init( &props );
+				// Match the history to the normal independent packed-block size.
+				props.dictSize = MAX_SHADER_UNPACKED_BLOCK_SIZE;
 				m_Status = LzmaEnc_SetProps( m_Handle, &props );
 			}
 		}

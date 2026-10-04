@@ -24,6 +24,7 @@
 #include <vector>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <optional>
 #include <future>
 #include <memory>
@@ -104,6 +105,7 @@ struct CompileResult
 	ID3DBlob* shader = nullptr;
 	ID3DBlob* listing = nullptr;
 	HRESULT status = E_FAIL;
+	uint64_t compileNs = 0; // Published with the result before the promise is fulfilled.
 
 	~CompileResult()
 	{
@@ -150,10 +152,11 @@ namespace
 	uint64_t s_CacheGeneration = 0;
 	bool s_bPreprocessCache = true; // Configuration, set before workers start.
 	std::atomic<bool> s_bAdaptivePreprocessCache{ true };
-	std::atomic<uint32_t> s_PreprocessSamples{ 0 };
-	std::atomic<uint32_t> s_PreprocessHits{ 0 };
+	using CacheClock = std::chrono::steady_clock;
+	// Window statistics are protected by s_CacheMutex.
+	uint32_t s_PreprocessSamples = 0;
+	uint64_t s_CacheOverheadNs = 0, s_CacheSavedCompileNs = 0;
 	constexpr uint32_t AdaptiveSampleCount = 256;
-	constexpr uint32_t AdaptiveMinimumHitPercent = 1;
 	constexpr size_t MaxCacheBytes = 64 * 1024 * 1024;
 	constexpr size_t MaxCacheEntries = 4096;
 
@@ -164,7 +167,34 @@ namespace
 		++s_CacheGeneration;
 	}
 
-	std::shared_ptr<const CompileResult> Compile( const CfgProcessor::ComboBuildCommand& command,
+	uint64_t ElapsedNs( CacheClock::time_point start )
+	{
+		return static_cast<uint64_t>( std::chrono::duration_cast<std::chrono::nanoseconds>( CacheClock::now() - start ).count() );
+	}
+
+	void RecordCacheSample( CacheClock::time_point start, uint64_t compileNs, uint64_t savedCompileNs )
+	{
+		// Include key construction, cache lookup and waiting for an in-flight result.
+		const uint64_t overheadNs = ElapsedNs( start ) - compileNs;
+		std::lock_guard lock{ s_CacheMutex };
+		if ( !s_bAdaptivePreprocessCache.load( std::memory_order_acquire ) )
+			return;
+		++s_PreprocessSamples;
+		s_CacheOverheadNs += overheadNs;
+		s_CacheSavedCompileNs += savedCompileNs;
+		if ( s_PreprocessSamples < AdaptiveSampleCount )
+			return;
+		// Each hit is weighted by that cached result's own compilation time.
+		if ( s_CacheSavedCompileNs <= s_CacheOverheadNs * 1.1L )
+		{
+			s_bAdaptivePreprocessCache.store( false, std::memory_order_release );
+			ClearCacheUnlocked();
+		}
+		s_PreprocessSamples = 0;
+		s_CacheOverheadNs = s_CacheSavedCompileNs = 0;
+	}
+
+	std::shared_ptr<CompileResult> Compile( const CfgProcessor::ComboBuildCommand& command,
 		const CSharedFile& source, const D3D_SHADER_MACRO* macros, unsigned int flags )
 	{
 		auto result = std::make_shared<CompileResult>();
@@ -191,8 +221,8 @@ void Compiler::SetPreprocessCacheEnabled( bool enabled )
 
 void Compiler::BeginPreprocessCacheRange()
 {
-	s_PreprocessSamples.store( 0, std::memory_order_relaxed );
-	s_PreprocessHits.store( 0, std::memory_order_relaxed );
+	s_PreprocessSamples = 0;
+	s_CacheOverheadNs = s_CacheSavedCompileNs = 0;
 	s_bAdaptivePreprocessCache.store( s_bPreprocessCache, std::memory_order_release );
 	ClearCompileCache();
 }
@@ -230,6 +260,15 @@ void Compiler::ExecuteCommand( const CfgProcessor::ComboBuildCommand& command, C
 		return;
 	}
 
+	const auto cacheStart = CacheClock::now();
+	const auto compileWithoutCache = [&]
+	{
+		const auto compileStart = CacheClock::now();
+		auto result = Compile( command, *source, macros.data(), flags );
+		const uint64_t compileNs = ElapsedNs( compileStart );
+		response = new CResponse( std::move( result ) );
+		RecordCacheSample( cacheStart, compileNs, 0 );
+	};
 	CompileResult preprocessed;
 	DxIncludeImpl includes;
 	preprocessed.status = D3DPreprocess( source->Data(), source->Size(), command.fileName.data(), macros.data(),
@@ -237,7 +276,7 @@ void Compiler::ExecuteCommand( const CfgProcessor::ComboBuildCommand& command, C
 	// Preserve the original compiler diagnostics for preprocessing errors or warnings.
 	if ( FAILED( preprocessed.status ) || !preprocessed.shader || preprocessed.listing || !includes.cacheSafe.load() )
 	{
-		response = new CResponse( Compile( command, *source, macros.data(), flags ) );
+		compileWithoutCache();
 		return;
 	}
 
@@ -250,7 +289,7 @@ void Compiler::ExecuteCommand( const CfgProcessor::ComboBuildCommand& command, C
 	key.append( static_cast<const char*>( preprocessed.shader->GetBufferPointer() ), preprocessed.shader->GetBufferSize() );
 	if ( key.size() > MaxCacheBytes )
 	{
-		response = new CResponse( Compile( command, *source, macros.data(), flags ) );
+		compileWithoutCache();
 		return;
 	}
 
@@ -264,10 +303,8 @@ void Compiler::ExecuteCommand( const CfgProcessor::ComboBuildCommand& command, C
 	{
 		std::lock_guard lock{ s_CacheMutex };
 		const auto found = s_CompileCache.find( cacheKey );
-		s_PreprocessSamples.fetch_add( 1, std::memory_order_relaxed );
 		if ( found != s_CompileCache.end() )
 		{
-			s_PreprocessHits.fetch_add( 1, std::memory_order_relaxed );
 			future = found->second;
 		}
 		else
@@ -282,23 +319,16 @@ void Compiler::ExecuteCommand( const CfgProcessor::ComboBuildCommand& command, C
 			producer = true;
 		}
 	}
-	const uint32_t samples = s_PreprocessSamples.load( std::memory_order_relaxed );
-	if ( samples >= AdaptiveSampleCount && s_bAdaptivePreprocessCache.load( std::memory_order_acquire ) )
-	{
-		const uint32_t hits = s_PreprocessHits.load( std::memory_order_relaxed );
-		if ( hits * 100 < samples * AdaptiveMinimumHitPercent )
-		{
-			bool expected = true;
-			if ( s_bAdaptivePreprocessCache.compare_exchange_strong( expected, false, std::memory_order_acq_rel ) )
-				ClearCompileCache();
-		}
-	}
+	uint64_t compileNs = 0;
 	if ( producer )
 	{
 		try
 		{
 			// Cache misses still compile the original input; only equal expanded inputs reuse results.
+			const auto compileStart = CacheClock::now();
 			auto result = Compile( command, *source, macros.data(), flags );
+			compileNs = ElapsedNs( compileStart );
+			result->compileNs = compileNs;
 			{
 				std::lock_guard lock{ s_CacheMutex };
 				if ( generation == s_CacheGeneration )
@@ -317,5 +347,8 @@ void Compiler::ExecuteCommand( const CfgProcessor::ComboBuildCommand& command, C
 			throw;
 		}
 	}
-	response = new CResponse( future.get() );
+	auto result = future.get();
+	const uint64_t savedCompileNs = producer ? 0 : result->compileNs;
+	response = new CResponse( std::move( result ) );
+	RecordCacheSample( cacheStart, compileNs, savedCompileNs );
 }
