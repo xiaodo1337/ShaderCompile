@@ -13,6 +13,7 @@ ShaderCompile.exe [OPTIONS] -ver n -shaderdir src_dir shader.fxc
 -dynamic                       Generate only header
 -force                         Skip crc check during compilation
 -threads ARG                   Number of threads used, defaults to core count
+-noresume                      Disable partial static-combo checkpoints
 
 -h, -help                      Shows help
 -verbose                       Verbose file cache and final shader info

@@ -48,6 +48,10 @@
 #include "termcolors.hpp"
 #include "strmanip.hpp"
 #include "shaderparser.h"
+#include "resumejournal.h"
+#include "resumeidentity.h"
+#include <map>
+#include <unordered_set>
 
 extern "C" {
 #define _7ZIP_ST
@@ -59,7 +63,21 @@ extern "C" {
 #undef _7ZIP_ST
 }
 
+#ifdef T
+#undef T
+#endif
+#ifdef IN
+#undef IN
+#endif
+
 #include "LZMA.hpp"
+
+#ifdef T
+#undef T
+#endif
+#ifdef IN
+#undef IN
+#endif
 
 #pragma comment( lib, "DbgHelp" )
 
@@ -95,6 +113,127 @@ static Clock::time_point g_flStartTime;
 static bool g_bVerbose	= false;
 static bool g_bVerbose2 = false;
 static bool g_bFastFail = false;
+static bool g_bResume = true;
+static bool g_bForce = false;
+static std::atomic<bool> g_bInterrupted{ false };
+static std::map<std::string, std::string> g_ResumeIdentities;
+static std::unique_ptr<ResumeJournal> g_ResumeJournal;
+// Immutable while worker threads run. Newly completed blocks are not inserted.
+static std::unordered_set<uint64_t> g_RestoredStaticCombos;
+static std::unordered_set<uint64_t> g_FailedStaticCombos;
+
+static fs::path ResolveResumeInputPath( const std::string& file )
+{
+	const fs::path relative = fs::path( file );
+	const fs::path fromShaderRoot = g_pShaderPath / relative;
+	if ( fs::is_regular_file( fromShaderRoot ) )
+		return fromShaderRoot;
+
+	for ( const auto& includePath : g_pIncludePaths )
+	{
+		const fs::path candidate = includePath / relative;
+		if ( fs::is_regular_file( candidate ) )
+			return candidate;
+		const fs::path byName = includePath / relative.filename();
+		if ( fs::is_regular_file( byName ) )
+			return byName;
+	}
+
+	throw std::runtime_error( "Cannot resolve shader input " + file );
+}
+
+static std::string BuildResumeIdentity( const CfgProcessor::ShaderConfig& conf, uint32_t flags, bool isCSGO, bool cached = false )
+{
+	static const std::string toolchain = ResumeIdentity::Toolchain();
+	ResumeIdentity identity;
+	identity.Add( "ShaderCompile resume v1" );
+	identity.Add( toolchain );
+	identity.Add( g_pShaderPath.generic_string() );
+	for ( const auto& path : g_pIncludePaths )
+		identity.Add( path.generic_string() );
+	identity.Add( conf.name );
+	identity.Add( conf.target );
+	identity.Add( conf.version );
+	identity.Add( conf.main );
+	identity.Add( std::to_string( flags ) );
+	identity.Add( std::to_string( SHADER_VCS_VERSION_NUMBER ) );
+	identity.Add( isCSGO ? "csgo" : "source" );
+	identity.Add( std::to_string( conf.centroid_mask ) );
+	const auto combos = [&]( const auto& values )
+	{
+		identity.Add( std::to_string( values.size() ) );
+		for ( const auto& combo : values )
+		{
+			identity.Add( combo.name );
+			identity.Add( std::to_string( combo.minVal ) );
+			identity.Add( std::to_string( combo.maxVal ) );
+			identity.Add( combo.initVal );
+		}
+	};
+	combos( conf.static_c );
+	combos( conf.dynamic_c );
+	identity.Add( std::to_string( conf.skip.size() ) );
+	for ( const auto& skip : conf.skip )
+		identity.Add( skip );
+	std::set<std::string> includes( conf.includes.begin(), conf.includes.end() );
+	for ( const auto& file : includes )
+	{
+		const fs::path path = ResolveResumeInputPath( file );
+		if ( cached )
+		{
+			const auto* source = fileCache.Get( fs::path( file ).filename().string() );
+			if ( !source )
+				throw std::runtime_error( "Missing cached shader input " + file );
+			identity.Add( path.generic_string() );
+			identity.Add( std::string_view( static_cast<const char*>( source->Data() ), source->Size() ) );
+		}
+		else
+			identity.File( path );
+	}
+	return identity.Finish();
+}
+
+static bool CompletedShaderMatches( const fs::path& path, const std::string& identity )
+{
+	fs::path stampPath = path;
+	stampPath += ".stamp";
+	std::ifstream stamp( stampPath );
+	std::string savedIdentity, savedOutput;
+	if ( !( stamp >> savedIdentity >> savedOutput ) || savedIdentity != identity )
+		return false;
+	try
+	{
+		ResumeIdentity output;
+		output.File( path );
+		return output.Finish() == savedOutput;
+	}
+	catch ( const std::exception& ) { return false; }
+}
+
+static void PublishFile( const fs::path& temporary, const fs::path& destination )
+{
+	if ( !MoveFileExW( temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) )
+		throw std::runtime_error( "Cannot publish shader output " + destination.string() );
+}
+
+static void WriteCompletionStamp( const fs::path& path, const std::string& identity )
+{
+	ResumeIdentity outputIdentity;
+	outputIdentity.File( path );
+	fs::path stampPath = path;
+	stampPath += ".stamp";
+	fs::path stampTemporary = stampPath;
+	stampTemporary += ".tmp";
+	std::ofstream stamp( stampTemporary, std::ios::trunc );
+	stamp << identity << '\n' << outputIdentity.Finish() << '\n';
+	stamp.flush();
+	if ( !stamp )
+		throw std::runtime_error( "Cannot write shader completion stamp" );
+	stamp.close();
+	if ( stamp.fail() )
+		throw std::runtime_error( "Cannot close shader completion stamp" );
+	PublishFile( stampTemporary, stampPath );
+}
 
 static constexpr const std::string_view lineRewind = "\033[2K"sv;
 static constexpr const std::string_view endLine = "\r"sv;
@@ -518,7 +657,7 @@ static void WriteShaderFiles( std::string_view pShaderName )
 		return;
 
 	const bool bShaderFailed                = g_ShaderHadError.contains( pShaderName );
-	const char* const szShaderFileOperation = bShaderFailed ? "Removing failed" : "Writing";
+	const char* const szShaderFileOperation = bShaderFailed ? "Failed (previous output retained)" : "Writing";
 
 	static Clock::time_point lastTime = g_flStartTime;
 
@@ -551,8 +690,7 @@ static void WriteShaderFiles( std::string_view pShaderName )
 
 	if ( bShaderFailed )
 	{
-		std::error_code c;
-		fs::remove( path, c );
+		delete pByteCodeArray;
 		std::cout << "\r"sv << clr::escaped( lineRewind ) << clr::red << pShaderName << clr::reset << " "sv << FormatTimeShort( duration_cast<chrono::seconds>( Clock::now() - lastTime ).count() ) << std::endl;
 		lastTime = Clock::now();
 		return;
@@ -626,7 +764,9 @@ static void WriteShaderFiles( std::string_view pShaderName )
 	//
 	// Shader file stream buffer
 	//
-	std::ofstream ShaderFile( path, std::ios::binary | std::ios::trunc ); // Streaming buffer for vcs file (since this can blow memory)
+	fs::path temporary = path;
+	temporary += ".tmp";
+	std::ofstream ShaderFile( temporary, std::ios::binary | std::ios::trunc ); // Streaming buffer for vcs file (since this can blow memory)
 
 	// ------ Header --------------
 	const ShaderHeader_t header {
@@ -682,7 +822,14 @@ static void WriteShaderFiles( std::string_view pShaderName )
 	for ( const StaticComboRecord_t& SRec : StaticComboHeaders )
 		ShaderFile.write( reinterpret_cast<const char*>( &SRec ), sizeof( StaticComboRecord_t ) );
 
+	ShaderFile.flush();
+	if ( !ShaderFile )
+		throw std::runtime_error( "Shader output write failed (check free disk space)" );
 	ShaderFile.close();
+	if ( ShaderFile.fail() )
+		throw std::runtime_error( "Cannot close shader output" );
+	PublishFile( temporary, path );
+	WriteCompletionStamp( path, g_ResumeIdentities.at( std::string( pShaderName ) ) );
 
 	// Finalize, free memory
 	delete pByteCodeArray;
@@ -695,6 +842,9 @@ static void WriteShaderFiles( std::string_view pShaderName )
 // return the length of the package.
 static size_t AssembleWorkerReplyPackage( const CfgProcessor::CfgEntryInfo* pEntry, uint64_t nComboOfEntry, CUtlBuffer& pBuf )
 {
+	// Restored blocks are already packed; never delete or reassemble them.
+	if ( g_RestoredStaticCombos.contains( nComboOfEntry ) )
+		return 0;
 	CStaticCombo* pStComboRec;
 	StaticComboNodeHash_t* pByteCodeArray;
 	{
@@ -830,6 +980,22 @@ private:
 	void TryToPackageData( uint64_t iCommandNumber );
 };
 
+static void SkipRestoredCombos( uint64_t& command, CfgProcessor::ComboHandle& combo, uint64_t end )
+{
+	while ( combo )
+	{
+		const auto* entry = Combo_GetEntryInfo( combo );
+		const uint64_t id = Combo_GetComboNum( combo ) / entry->m_numDynamicCombos;
+		if ( !g_RestoredStaticCombos.contains( id ) )
+			break;
+		command = entry->m_iCommandStart + ( entry->m_numStaticCombos - id ) * entry->m_numDynamicCombos;
+		Combo_Free( combo );
+		if ( command >= end )
+			return;
+		Combo_GetNext( command, combo, end );
+	}
+}
+
 template <typename TMutexType>
 void CWorkerAccumState<TMutexType>::RangeBegin( uint64_t iFirstCommand, uint64_t iEndCommand )
 {
@@ -839,6 +1005,7 @@ void CWorkerAccumState<TMutexType>::RangeBegin( uint64_t iFirstCommand, uint64_t
 	m_iLastFinished = iFirstCommand;
 	m_hCombo        = nullptr;
 	CfgProcessor::Combo_GetNext( m_iNextCommand, m_hCombo, m_iEndCommand );
+	SkipRestoredCombos( m_iNextCommand, m_hCombo, m_iEndCommand );
 }
 
 template <typename TMutexType>
@@ -891,6 +1058,7 @@ void CWorkerAccumState<TMutexType>::HandleCommandResponse( CfgProcessor::ComboHa
 	{
 		std::lock_guard guard{ Threading::g_mtxGlobal };
 		ShaderHadErrorDispatchInt( pEntryInfo->m_szName );
+		g_FailedStaticCombos.insert( iComboIndex / pEntryInfo->m_numDynamicCombos );
 	}
 
 	// Process listing even if the shader succeeds for warnings
@@ -974,6 +1142,27 @@ void CWorkerAccumState<TMutexType>::TryToPackageData( uint64_t iCommandNumber )
 			{
 				mbPacked.SeekGet( CUtlBuffer::SEEK_HEAD, 0 );
 				mbPacked.Get( pCodeBuffer, gsl::narrow<int>( nPackedLength ) );
+				bool failed;
+				{
+					std::lock_guard lock{ Threading::g_mtxGlobal };
+					failed = g_FailedStaticCombos.contains( nComboBegin );
+				}
+				if ( g_ResumeJournal && !failed )
+				{
+					try { g_ResumeJournal->Append( nComboBegin, pCodeBuffer, nPackedLength ); }
+					catch ( const std::exception& error )
+					{
+						{
+							std::lock_guard lock{ Threading::g_mtxGlobal };
+							ShaderHadErrorDispatchInt( pInfoBegin->m_szName );
+						}
+						{
+							std::lock_guard lock{ Threading::g_mtxMsgReport };
+							std::cerr << "\n" << error.what() << std::endl;
+						}
+						StopCommandRange();
+					}
+				}
 			}
 		}
 
@@ -1016,6 +1205,7 @@ bool CWorkerAccumState<TMutexType>::OnProcess()
 				Combo_Assign( hThreadCombo, m_hCombo );
 				*iCurrentId = Combo_GetCommandNum( hThreadCombo );
 				Combo_GetNext( iThreadCommand, m_hCombo, m_iEndCommand );
+				SkipRestoredCombos( iThreadCommand, m_hCombo, m_iEndCommand );
 			}
 			else
 			{
@@ -1025,7 +1215,7 @@ bool CWorkerAccumState<TMutexType>::OnProcess()
 			}
 		}
 
-		if ( hThreadCombo && !m_bBreak.load( std::memory_order_acquire ) )
+		if ( hThreadCombo && !m_bBreak.load( std::memory_order_acquire ) && !g_bInterrupted.load() )
 			ExecuteCompileCommand( hThreadCombo );
 		else
 			break;
@@ -1038,11 +1228,12 @@ bool CWorkerAccumState<TMutexType>::OnProcess()
 template <typename TMutexType>
 void CWorkerAccumState<TMutexType>::OnProcessST()
 {
-	while ( m_hCombo && !m_bBreak.load( std::memory_order_acquire ) )
+	while ( m_hCombo && !m_bBreak.load( std::memory_order_acquire ) && !g_bInterrupted.load() )
 	{
 		ExecuteCompileCommand( m_hCombo );
 
 		Combo_GetNext( m_iNextCommand, m_hCombo, m_iEndCommand );
+		SkipRestoredCombos( m_iNextCommand, m_hCombo, m_iEndCommand );
 	}
 }
 
@@ -1077,7 +1268,7 @@ public:
 	void ProcessCommandRange( uint64_t shaderStart, uint64_t shaderEnd );
 
 	void Stop();
-	bool Stoped() const { return m_bStopped; }
+	bool Stoped() const { return m_bStopped.load() || g_bInterrupted.load(); }
 
 protected:
 	void Startup( uint32_t flags );
@@ -1093,7 +1284,7 @@ protected:
 	};
 
 	const uint32_t m_nThreads;
-	bool m_bStopped = false;
+	std::atomic<bool> m_bStopped{ false };
 };
 
 // TODO: Cleanup this hack
@@ -1139,13 +1330,15 @@ void ProcessCommandRange_Singleton::ProcessCommandRange( uint64_t shaderStart, u
 	{
 		m_MT->RangeBegin( shaderStart, shaderEnd );
 		m_MT->Run( m_nThreads );
-		m_MT->RangeFinished();
+		if ( !Stoped() )
+			m_MT->RangeFinished();
 	}
 	else
 	{
 		m_ST->RangeBegin( shaderStart, shaderEnd );
 		m_ST->OnProcessST();
-		m_ST->RangeFinished();
+		if ( !Stoped() )
+			m_ST->RangeFinished();
 	}
 }
 
@@ -1180,7 +1373,7 @@ struct ShaderInputData
 	bool operator==(const ShaderInputData&) const = default;
 	std::strong_ordering operator<=>(const ShaderInputData&) const = default;
 };
-static std::unique_ptr<CfgProcessor::CfgEntryInfo[]> Shared_ParseListOfCompileCommands( std::set<ShaderInputData> files, bool bForce, bool bSpewSkips, bool isCSGO )
+static std::unique_ptr<CfgProcessor::CfgEntryInfo[]> Shared_ParseListOfCompileCommands( std::set<ShaderInputData> files, bool bForce, bool bSpewSkips, bool isCSGO, uint32_t flags )
 {
 	using namespace std::literals;
 	const Clock::time_point tt_start = Clock::now();
@@ -1190,10 +1383,9 @@ static std::unique_ptr<CfgProcessor::CfgEntryInfo[]> Shared_ParseListOfCompileCo
 	const auto root = g_pShaderPath.string();
 	for ( const auto& file : files )
 	{
-		uint32_t crc;
+		uint32_t crc = 0;
 		std::string name = Parser::ConstructName( file.name, file.target, file.version );
-		if ( Parser::CheckCrc( g_pShaderPath / file.name, g_pOutputPath, root, g_pIncludePaths, name, crc ) && !bForce )
-			continue;
+		const bool crcMatches = Parser::CheckCrc( g_pShaderPath / file.name, g_pOutputPath, root, g_pIncludePaths, name, crc );
 
 		CfgProcessor::ShaderConfig conf;
 		if ( !Parser::ParseFile( g_pShaderPath / file.name, root, g_pIncludePaths, file.target, file.version, conf ) )
@@ -1202,7 +1394,28 @@ static std::unique_ptr<CfgProcessor::CfgEntryInfo[]> Shared_ParseListOfCompileCo
 			failed = true;
 			continue;
 		}
+		conf.name = name;
+		conf.target = file.target;
+		conf.version = file.version;
+		const std::string identity = BuildResumeIdentity( conf, flags, isCSGO );
+		g_ResumeIdentities[name] = identity;
 		Parser::WriteInclude( g_pOutputPath / "include"sv / ( name + ".inc" ), name, file.target, conf.static_c, conf.dynamic_c, conf.skip, isCSGO );
+		const fs::path output = g_pOutputPath / "shaders" / "fxc" / ( name + ".vcs" );
+		if ( crcMatches && !bForce )
+		{
+			if ( CompletedShaderMatches( output, identity ) )
+			{
+				if ( g_bVerbose )
+					std::cout << "Up to date: " << name << std::endl;
+				continue;
+			}
+
+			// Legacy outputs with a matching CRC are already complete. Do not
+			// create a stamp for them; stamps are only needed for new outputs.
+			if ( g_bVerbose )
+				std::cout << "Up to date: " << name << std::endl;
+			continue;
+		}
 		conf.name = std::move( name );
 		conf.crc32 = crc;
 		conf.target = file.target;
@@ -1217,6 +1430,9 @@ static std::unique_ptr<CfgProcessor::CfgEntryInfo[]> Shared_ParseListOfCompileCo
 		exit( 0 );
 
 	CfgProcessor::SetupConfiguration( configs, g_pShaderPath, g_bVerbose );
+	// Fingerprint the actual compiler input snapshot, rather than re-reading it.
+	for ( const auto& conf : configs )
+		g_ResumeIdentities[conf.name] = BuildResumeIdentity( conf, flags, isCSGO, true );
 
 	auto arrEntries = CfgProcessor::DescribeConfiguration( bSpewSkips );
 
@@ -1256,7 +1472,32 @@ static void CompileShaders( std::unique_ptr<CfgProcessor::CfgEntryInfo[]> arrEnt
 		//
 		// Compile stuff
 		//
+		const fs::path cacheDirectory = g_pOutputPath / "shadercache";
+		fs::create_directories( cacheDirectory );
+		const fs::path lockPath = cacheDirectory / ( std::string( pEntry->m_szName ) + ".lock" );
+		auto cacheLock = std::make_unique<ResumeLock>( lockPath );
+		fs::path completedJournal;
+		g_RestoredStaticCombos.clear();
+		g_FailedStaticCombos.clear();
+		g_ResumeJournal.reset();
+		if ( g_bInterrupted.load() )
+			break;
+		if ( g_bResume )
+		{
+			const std::string& identity = g_ResumeIdentities.at( std::string( pEntry->m_szName ) );
+			completedJournal = cacheDirectory / ( std::string( pEntry->m_szName ) + "." + identity + ".resume" );
+			g_ResumeJournal = std::make_unique<ResumeJournal>();
+			g_ResumeJournal->Open( completedJournal, identity, pEntry->m_numStaticCombos, g_bForce,
+				[&]( uint64_t id, const std::vector<uint8_t>& code )
+				{
+					if ( g_RestoredStaticCombos.insert( id ).second )
+						memcpy( StaticComboFromDictAdd( pEntry->m_szName, id )->AllocPackedCodeBlock( code.size() ), code.data(), code.size() );
+				} );
+			std::cout << "\nResume: " << pEntry->m_szName << ": " << g_RestoredStaticCombos.size()
+				<< " completed static combos restored; cache " << completedJournal << std::endl;
+		}
 		pcr.ProcessCommandRange( pEntry->m_iCommandStart, pEntry->m_iCommandEnd );
+		g_ResumeJournal.reset();
 
 		if ( pcr.Stoped() )
 			break;
@@ -1265,6 +1506,16 @@ static void CompileShaders( std::unique_ptr<CfgProcessor::CfgEntryInfo[]> arrEnt
 		// Now when the whole shader is finished we can write it
 		//
 		WriteShaderFiles( pEntry->m_szName );
+		g_ResumeJournal.reset();
+		cacheLock.reset();
+		std::error_code error;
+		if ( !completedJournal.empty() )
+			fs::remove( completedJournal, error );
+		fs::path stampPath = g_pOutputPath / "shaders" / "fxc" / ( std::string( pEntry->m_szName ) + ".vcs.stamp" );
+		fs::remove( stampPath, error );
+		fs::remove( lockPath, error );
+		if ( error && g_bVerbose )
+			std::cerr << "Cannot remove completed shader cache files for " << pEntry->m_szName << ": " << error.message() << std::endl;
 	}
 
 	std::cout << "\r"sv << clr::escaped( lineRewind ) << endLine;
@@ -1409,16 +1660,13 @@ static void PrintCompileErrors( bool skipWarnings )
 		std::cout << clr::escaped( "\033[2K"sv ) << clr::pinkish << "FAILED: "sv << clr::red << failed << clr::reset << std::endl;
 }
 
-static bool s_write = true;
 static BOOL WINAPI CtrlHandler( DWORD signal )
 {
 	if ( signal == CTRL_C_EVENT )
 	{
-		s_write = false;
-		if ( auto inst = ProcessCommandRange_Singleton::Instance() )
-			inst->Stop();
-		PrintCompileErrors( false );
+		g_bInterrupted.store( true );
 		SetThreadExecutionState( ES_CONTINUOUS );
+		return TRUE; // Let worker threads finish and close their journals safely.
 	}
 
 	return FALSE;
@@ -1426,8 +1674,7 @@ static BOOL WINAPI CtrlHandler( DWORD signal )
 
 static void WriteStats( bool skipWarnings )
 {
-	if ( s_write )
-		PrintCompileErrors( skipWarnings );
+	PrintCompileErrors( skipWarnings );
 
 	//
 	// End
@@ -1513,6 +1760,7 @@ int main( int argc, const char* argv[] )
 		cmdLine.add( "", false, 0, 0, "Generate ShaderComboSemantics_t and friends for shader", "-csgo", "/csgo" );
 	}
 
+	cmdLine.add( "", false, 0, 0, "Disable static-combo checkpoint and recovery", "-noresume", "/noresume" );
 	cmdLine.parse( argc, argv );
 
 	if ( cmdLine.isSet( "-help" ) )
@@ -1732,12 +1980,14 @@ int main( int argc, const char* argv[] )
 	g_bVerbose = cmdLine.isSet( "-verbose" );
 	g_bVerbose2 = cmdLine.isSet( "-verbose2" );
 	g_bFastFail = cmdLine.isSet( "-fastfail" );
+	g_bResume = !cmdLine.isSet( "-noresume" );
+	g_bForce = !parseLegacy && cmdLine.isSet( "-force" );
 
 	// Setting up the minidump handlers
 	SetUnhandledExceptionFilter( ExceptionFilter );
 	SetThreadExecutionState( ES_CONTINUOUS | ES_SYSTEM_REQUIRED );
 
-	auto entries = Shared_ParseListOfCompileCommands( std::move( files ), cmdLine.isSet( "-force" ), cmdLine.isSet( "-verbose_preprocessor" ), isCSGO );
+	auto entries = Shared_ParseListOfCompileCommands( std::move( files ), cmdLine.isSet( "-force" ), cmdLine.isSet( "-verbose_preprocessor" ), isCSGO, flags );
 
 	unsigned long threads = 0;
 	cmdLine.get( "-threads" )->getULong( threads );
@@ -1765,5 +2015,7 @@ int main( int argc, const char* argv[] )
 
 	SetThreadExecutionState( ES_CONTINUOUS );
 
+	if ( g_bInterrupted.load() )
+		return 130;
 	return gsl::narrow_cast<int>( g_ShaderHadError.size() );
 }

@@ -24,7 +24,7 @@ set(SRC
     )
 
 add_executable(ShaderCompile ${SRC})
-target_link_libraries(ShaderCompile PRIVATE re2::re2 Microsoft.GSL::GSL)
+target_link_libraries(ShaderCompile PRIVATE re2::re2 Microsoft.GSL::GSL bcrypt)
 include_directories(ShaderCompile/include shared/re2)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus")
