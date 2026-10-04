@@ -83,6 +83,10 @@ using ComboHandle = __ComboHandle*;
 
 ComboHandle Combo_GetCombo( uint64_t iCommandNumber );
 void Combo_GetNext( uint64_t& riCommandNumber, ComboHandle& rhCombo, uint64_t iCommandEnd );
+// Seek and advance inside one shader range without releasing the reusable handle.
+bool Combo_Seek( uint64_t command, ComboHandle& combo, uint64_t end );
+bool Combo_NextInRange( ComboHandle combo, uint64_t end ) noexcept;
+uint64_t Combo_SkippedRangeEnd( ComboHandle combo ) noexcept;
 void Combo_FormatCommandHumanReadable( ComboHandle hCombo, gsl::span<char> pchBuffer );
 uint64_t Combo_GetCommandNum( ComboHandle hCombo ) noexcept;
 uint64_t Combo_GetComboNum( ComboHandle hCombo ) noexcept;
@@ -95,7 +99,8 @@ struct ComboBuildCommand
 	std::string_view shaderModel;
 	std::vector<std::pair<std::string_view, std::string_view>> defines;
 };
-ComboBuildCommand Combo_BuildCommand( ComboHandle hCombo );
+// The command and macro views remain valid until the next build command on this thread.
+const ComboBuildCommand& Combo_BuildCommand( ComboHandle hCombo );
 
 ComboHandle Combo_Alloc( ComboHandle hComboCopyFrom ) noexcept;
 void Combo_Assign( ComboHandle hComboDst, ComboHandle hComboSrc );

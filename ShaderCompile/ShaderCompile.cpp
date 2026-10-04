@@ -22,12 +22,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <future>
 #include <filesystem>
 #include <regex>
 #include <set>
 #include <thread>
-#include <immintrin.h>
 #include <inttypes.h>
 
 #include "basetypes.h"
@@ -36,7 +34,6 @@
 #include "d3dxfxc.h"
 #include "shader_vcs_version.h"
 #include "utlbuffer.h"
-#include "utlnodehash.h"
 
 #include "ezOptionParser.hpp"
 #include "termcolor/style.hpp"
@@ -44,7 +41,6 @@
 #include "robin_hood.h"
 
 #include "CRC32.hpp"
-#include "movingaverage.hpp"
 #include "termcolors.hpp"
 #include "strmanip.hpp"
 #include "shaderparser.h"
@@ -52,6 +48,7 @@
 #include "resumeidentity.h"
 #include <map>
 #include <unordered_set>
+#include <unordered_map>
 
 extern "C" {
 #define _7ZIP_ST
@@ -120,7 +117,6 @@ static std::map<std::string, std::string> g_ResumeIdentities;
 static std::unique_ptr<ResumeJournal> g_ResumeJournal;
 // Immutable while worker threads run. Newly completed blocks are not inserted.
 static std::unordered_set<uint64_t> g_RestoredStaticCombos;
-static std::unordered_set<uint64_t> g_FailedStaticCombos;
 
 static fs::path ResolveResumeInputPath( const std::string& file )
 {
@@ -270,6 +266,8 @@ struct CByteCodeBlock : private std::unique_ptr<uint8_t[]>
 	using std::unique_ptr<uint8_t[]>::get;
 };
 
+static std::atomic<uint64_t> g_nStaticComboInsertionOrder{ 0 };
+
 struct CStaticCombo // all the data for one static combo
 {
 	struct PackedCode : private std::unique_ptr<uint8_t[]>
@@ -301,9 +299,9 @@ struct CStaticCombo // all the data for one static combo
 
 		using std::unique_ptr<uint8_t[]>::operator bool;
 	};
-	CStaticCombo *m_pNext, *m_pPrev;
 private:
 	uint64_t m_nStaticComboID;
+	uint64_t m_nInsertionOrder;
 
 	std::vector<std::unique_ptr<CByteCodeBlock>> m_DynamicCombos;
 
@@ -325,9 +323,9 @@ public:
 		return m_nStaticComboID;
 	}
 
-	[[nodiscard]] CStaticCombo* Next() const
+	[[nodiscard]] uint64_t InsertionOrder() const
 	{
-		return m_pNext;
+		return m_nInsertionOrder;
 	}
 
 	[[nodiscard]] const PackedCode& Code() const
@@ -341,10 +339,9 @@ public:
 	}
 
 	CStaticCombo( uint64_t nComboID )
+		: m_nStaticComboID( nComboID )
+		, m_nInsertionOrder( g_nStaticComboInsertionOrder.fetch_add( 1, std::memory_order_relaxed ) )
 	{
-		m_nStaticComboID = nComboID;
-		m_pNext = nullptr;
-		m_pPrev = nullptr;
 	}
 
 	~CStaticCombo() = default;
@@ -365,7 +362,7 @@ public:
 	}
 };
 
-using StaticComboNodeHash_t = CUtlNodeHash<CStaticCombo, 7097, uint64_t>;
+using StaticComboNodeHash_t = std::unordered_map<uint64_t, std::unique_ptr<CStaticCombo>>;
 using CShaderMap = robin_hood::unordered_map<std::string_view, StaticComboNodeHash_t*>;
 static CShaderMap g_ShaderByteCode;
 
@@ -375,21 +372,20 @@ static CStaticCombo* StaticComboFromDictAdd( std::string_view pszShaderName, uin
 	if ( !rpNodeHash )
 		rpNodeHash = new StaticComboNodeHash_t;
 
-	// search for this static combo. make it if not found
-	CStaticCombo* pStaticCombo = rpNodeHash->FindByKey( nStaticComboId );
-	if ( !pStaticCombo )
-	{
-		pStaticCombo = new CStaticCombo( nStaticComboId );
-		rpNodeHash->Add( pStaticCombo );
-	}
-
-	return pStaticCombo;
+	auto [it, inserted] = rpNodeHash->try_emplace( nStaticComboId );
+	if ( inserted )
+		it->second = std::make_unique<CStaticCombo>( nStaticComboId );
+	return it->second.get();
 }
 
 static CStaticCombo* StaticComboFromDict( std::string_view pszShaderName, uint64_t nStaticComboId )
 {
 	if ( StaticComboNodeHash_t* pNodeHash = g_ShaderByteCode[pszShaderName] )
-		return pNodeHash->FindByKey( nStaticComboId );
+	{
+		const auto it = pNodeHash->find( nStaticComboId );
+		if ( it != pNodeHash->end() )
+			return it->second.get();
+	}
 	return nullptr;
 }
 
@@ -552,7 +548,7 @@ static void FlushCombos( size_t& pnTotalFlushedSize, CUtlBuffer& pDynamicComboBu
 		return;
 
 	size_t nCompressedSize;
-	uint8_t* pCompressedShader = LZMA::OpportunisticCompress( reinterpret_cast<uint8_t*>( pDynamicComboBuffer.Base() ), pDynamicComboBuffer.TellPut(), &nCompressedSize );
+	const uint8_t* pCompressedShader = LZMA::OpportunisticCompress( reinterpret_cast<uint8_t*>( pDynamicComboBuffer.Base() ), pDynamicComboBuffer.TellPut(), &nCompressedSize );
 	// high 2 bits of length =
 	// 00 = bzip2 compressed
 	// 10 = uncompressed
@@ -572,7 +568,6 @@ static void FlushCombos( size_t& pnTotalFlushedSize, CUtlBuffer& pDynamicComboBu
 		const uint32_t lFlagSize = 0x40000000 | gsl::narrow<uint32_t>( nCompressedSize );
 		pBuf.Put( &lFlagSize, sizeof( lFlagSize ) );
 		pBuf.Put( pCompressedShader, gsl::narrow<uint32_t>( nCompressedSize ) );
-		delete[] pCompressedShader;
 		pnTotalFlushedSize += sizeof( lFlagSize ) + nCompressedSize;
 	}
 	pDynamicComboBuffer.Clear(); // start over
@@ -638,8 +633,6 @@ static fs::path GetVCSFilenames( const ShaderInfo_t& si )
 // data that it uses might be updated by the main thread when built pieces
 // are received from the workers.
 //
-static constexpr uint32_t STATIC_COMBO_HASH_SIZE = 73;
-
 struct StaticComboAuxInfo_t : StaticComboRecord_t
 {
 	uint32_t m_nCRC32; // CRC32 of packed data
@@ -707,51 +700,65 @@ static void WriteShaderFiles( std::string_view pShaderName )
 	//
 	std::vector<StaticComboAuxInfo_t> StaticComboHeaders;
 
-	StaticComboHeaders.reserve( 1ULL + pByteCodeArray->Count() ); // we know how much ram we need
+	StaticComboHeaders.reserve( 1ULL + pByteCodeArray->size() ); // we know how much ram we need
 
+	constexpr size_t STATIC_COMBO_HASH_SIZE = 73;
 	std::vector<size_t> comboIndicesHashedByCRC32[STATIC_COMBO_HASH_SIZE];
 	std::vector<StaticComboAliasRecord_t> duplicateCombos;
 
-	// now, lets fill in our combo headers, sort, and write
-	for ( int nChain = 0; nChain < StaticComboNodeHash_t::NumChains; ++nChain )
+	// Reproduce the legacy CUtlNodeHash traversal: buckets are visited in order,
+	// and AddToHead makes newer entries appear before older entries in a bucket.
+	std::vector<CStaticCombo*> comboChains[7097];
+	for ( const auto& [id, entry] : *pByteCodeArray )
+		comboChains[id % 7097].push_back( entry.get() );
+
+	std::vector<CStaticCombo*> comboOrder;
+	comboOrder.reserve( pByteCodeArray->size() );
+	for ( auto& chainEntries : comboChains )
 	{
-		for ( CStaticCombo* pStatic = pByteCodeArray->Chain( nChain ).Head(); pStatic; pStatic = pStatic->Next() )
+		std::sort( chainEntries.begin(), chainEntries.end(), []( const CStaticCombo* a, const CStaticCombo* b )
 		{
-			const CStaticCombo::PackedCode& code = pStatic->Code();
-			if ( code.GetLength() )
+			return a->InsertionOrder() > b->InsertionOrder();
+		} );
+		comboOrder.insert( comboOrder.end(), chainEntries.begin(), chainEntries.end() );
+	}
+
+	// now, lets fill in our combo headers, sort, and write
+	for ( CStaticCombo* pStatic : comboOrder )
+	{
+		const CStaticCombo::PackedCode& code = pStatic->Code();
+		if ( code.GetLength() )
+		{
+			StaticComboAuxInfo_t hdr {
+				{
+					.m_nStaticComboID = gsl::narrow<uint32_t>( pStatic->ComboId() ),
+					.m_nFileOffset = 0,
+				},
+				CRC32::ProcessSingleBuffer( code.GetData(), code.GetLength() ),
+				pStatic
+			};
+
+			// now, see if we have an identical static combo
+			const uint32_t nHashIdx = hdr.m_nCRC32 % STATIC_COMBO_HASH_SIZE;
+			const auto& hash = comboIndicesHashedByCRC32[nHashIdx];
+			bool bIsDuplicate = false;
+			for ( const size_t i : hash )
 			{
-				StaticComboAuxInfo_t hdr {
-					{
-						.m_nStaticComboID = gsl::narrow<uint32_t>( pStatic->ComboId() ),
-						.m_nFileOffset = 0,
-					},
-					CRC32::ProcessSingleBuffer( code.GetData(), code.GetLength() ),
-					pStatic
-				};
-				const uint32_t nHashIdx = hdr.m_nCRC32 % STATIC_COMBO_HASH_SIZE;
-				__assume( 0 <= nHashIdx && nHashIdx < STATIC_COMBO_HASH_SIZE );
-
-				// now, see if we have an identical static combo
-				auto& hash = comboIndicesHashedByCRC32[nHashIdx];
-				bool bIsDuplicate = false;
-				for ( const size_t i : hash )
+				const StaticComboAuxInfo_t& check = StaticComboHeaders[i];
+				const CStaticCombo::PackedCode& checkCode = check.m_pByteCode->Code();
+				if ( check.m_nCRC32 == hdr.m_nCRC32 && checkCode.GetLength() == code.GetLength() && memcmp( checkCode.GetData(), code.GetData(), checkCode.GetLength() ) == 0 )
 				{
-					const StaticComboAuxInfo_t& check = StaticComboHeaders[i];
-					const CStaticCombo::PackedCode& checkCode = check.m_pByteCode->Code();
-					if ( check.m_nCRC32 == hdr.m_nCRC32 && checkCode.GetLength() == code.GetLength() && memcmp( checkCode.GetData(), code.GetData(), checkCode.GetLength() ) == 0 )
-					{
-						// this static combo is the same as another one!!
-						duplicateCombos.emplace_back( StaticComboAliasRecord_t { hdr.m_nStaticComboID, check.m_nStaticComboID } );
-						bIsDuplicate = true;
-						break;
-					}
+					// this static combo is the same as another one!!
+					duplicateCombos.emplace_back( StaticComboAliasRecord_t { hdr.m_nStaticComboID, check.m_nStaticComboID } );
+					bIsDuplicate = true;
+					break;
 				}
+			}
 
-				if ( !bIsDuplicate )
-				{
-					StaticComboHeaders.emplace_back( std::move( hdr ) );
-					hash.emplace_back( StaticComboHeaders.size() - 1 );
-				}
+			if ( !bIsDuplicate )
+			{
+				StaticComboHeaders.emplace_back( std::move( hdr ) );
+				comboIndicesHashedByCRC32[nHashIdx].push_back( StaticComboHeaders.size() - 1 );
 			}
 		}
 	}
@@ -801,7 +808,7 @@ static void WriteShaderFiles( std::string_view pShaderName )
 		SRec.m_nFileOffset = gsl::narrow<uint32_t>( ShaderFile.tellp() );
 		if ( SRec.m_nStaticComboID != 0xffffffff ) // sentinel key?
 		{
-			CStaticCombo* pStatic = pByteCodeArray->FindByKey( SRec.m_nStaticComboID );
+			CStaticCombo* pStatic = pByteCodeArray->at( SRec.m_nStaticComboID ).get();
 			Assert( pStatic );
 
 			// Put the packed chunk of code for this static combo
@@ -840,6 +847,18 @@ static void WriteShaderFiles( std::string_view pShaderName )
 
 // Assemble a reply package to the master from the compiled bytecode
 // return the length of the package.
+static std::string FormatComboProgress( uint64_t completed, uint64_t total )
+{
+	constexpr size_t width = 24;
+	const uint64_t clamped = std::min( completed, total );
+	const size_t filled = total ? static_cast<size_t>( clamped * width / total ) : width;
+	std::string bar( width, '-' );
+	std::fill_n( bar.begin(), filled, '=' );
+	if ( filled < width )
+		bar[filled] = '>';
+	return bar;
+}
+
 static size_t AssembleWorkerReplyPackage( const CfgProcessor::CfgEntryInfo* pEntry, uint64_t nComboOfEntry, CUtlBuffer& pBuf )
 {
 	// Restored blocks are already packed; never delete or reassemble them.
@@ -871,81 +890,109 @@ static size_t AssembleWorkerReplyPackage( const CfgProcessor::CfgEntryInfo* pEnt
 		FlushCombos( nBytesWritten, ubDynamicComboBuffer, pBuf );
 	}
 
-	// Time to limit amount of prints
-	static Clock::time_point s_fLastInfoTime;
-	static uint64_t s_nLastEntry = nComboOfEntry;
-	static CUtlMovingAverage<uint64_t, 60> s_averageProcess;
-	static std::string_view s_lastShader = pEntry->m_szName;
-	const Clock::time_point fCurTime = Clock::now();
-
+	static Clock::time_point lastInfoTime;
+	static uint64_t packedCount = 0;
+	static std::string_view lastShader;
+	const Clock::time_point now = Clock::now();
 	{
-		std::lock_guard guard{ Threading::g_mtxGlobal };
+		std::lock_guard lock{ Threading::g_mtxGlobal };
 		if ( pStComboRec )
+			pByteCodeArray->erase( nComboOfEntry );
+		if ( lastShader != pEntry->m_szName )
 		{
-			CStaticCombo *pCombo = pByteCodeArray->FindByKey( nComboOfEntry );
-			pByteCodeArray->DeleteByKey( nComboOfEntry );
-			delete pCombo;
+			packedCount = g_RestoredStaticCombos.size();
+			lastShader = pEntry->m_szName;
 		}
-		if ( duration_cast<chrono::seconds>( fCurTime - s_fLastInfoTime ).count() != 0 )
+		++packedCount;
+		if ( now - lastInfoTime >= chrono::seconds( 1 ) )
 		{
-			if ( s_lastShader.data() != pEntry->m_szName.data() )
-			{
-				s_averageProcess.Reset();
-				s_lastShader = pEntry->m_szName;
-				s_nLastEntry = nComboOfEntry;
-			}
-
-			s_averageProcess.PushValue( s_nLastEntry - nComboOfEntry );
-			s_nLastEntry = nComboOfEntry;
-			const auto avg = s_averageProcess.GetAverage();
-			std::cout << "\r"sv << clr::escaped( lineRewind ) << "Compiling "sv << ( g_ShaderHadError.contains( pEntry->m_szName ) ? clr::red : clr::green ) << pEntry->m_szName << clr::reset << " ["sv << clr::blue << PrettyPrint( nComboOfEntry ) << clr::reset << " remaining] "sv
-				<< FormatTimeShort( duration_cast<chrono::seconds>( fCurTime - g_flStartTime ).count() ) << " elapsed ("sv << clr::green2 << avg << clr::reset << " c/s, est. remaining "sv << FormatTimeShort( nComboOfEntry / std::max<uint64_t>( avg, 1 ) ) << ")"sv << endLine;
-			s_fLastInfoTime = fCurTime;
+			const uint64_t totalCombos = pEntry->m_numStaticCombos;
+			const uint64_t remaining = totalCombos > packedCount ? totalCombos - packedCount : 0;
+			std::cout << "\r"sv << clr::escaped( lineRewind ) << "Compiling "sv
+				<< ( g_ShaderHadError.contains( pEntry->m_szName ) ? clr::red : clr::green ) << pEntry->m_szName << clr::reset
+				<< " ["sv << clr::blue << FormatComboProgress( packedCount, totalCombos ) << clr::reset << "] "sv
+				<< clr::blue << PrettyPrint( packedCount ) << clr::reset << "/"sv
+				<< clr::blue << PrettyPrint( totalCombos ) << clr::reset << " combos, "sv
+				<< clr::blue << PrettyPrint( remaining ) << clr::reset << " remaining] "sv
+				<< FormatTimeShort( duration_cast<chrono::seconds>( now - g_flStartTime ).count() ) << " elapsed"sv
+				<< std::flush;
+			lastInfoTime = now;
 		}
 	}
 
 	return nBytesWritten;
 }
 
+static void StopCommandRange();
+
 template <typename TMutexType>
 class CWorkerAccumState
 {
 public:
-	explicit CWorkerAccumState( uint32_t iFlags ) noexcept
-		: m_iFirstCommand( 0 ), m_iNextCommand( 0 ), m_iEndCommand( 0 )
-		, m_iLastFinished( 0 ), m_hCombo( nullptr ), m_iFlags( iFlags ) {}
+	explicit CWorkerAccumState( uint32_t flags ) noexcept : m_iFlags( flags ) {}
 
-	void RangeBegin( uint64_t iFirstCommand, uint64_t iEndCommand );
-	void RangeFinished();
-
-	void ExecuteCompileCommand( CfgProcessor::ComboHandle hCombo );
-	void HandleCommandResponse( CfgProcessor::ComboHandle hCombo, CmdSink::IResponse* pResponse );
-
-	void Run( uint32_t i )
+	void RangeBegin( const CfgProcessor::CfgEntryInfo* entry )
 	{
-		m_arrSubProcessInfos.reserve( i );
-
-		std::vector<std::thread> threads;
-		threads.reserve( i );
-
-		while ( i-- > 0 )
-		{
-			++m_nActive;
-			threads.emplace_back( DoExecute, this );
-		}
-
-		constexpr const std::chrono::milliseconds sleepTime{ 250 };
-		while ( m_nActive )
-		{
-			_mm_pause();
-			std::this_thread::sleep_for( sleepTime );
-		}
-
-		std::for_each( threads.begin(), threads.end(), []( std::thread& t ) { if ( t.joinable() ) t.join(); } );
-		m_arrSubProcessInfos.clear();
+		m_pEntry = entry;
+		m_iNextStatic = 0;
+		m_bBreak.store( false, std::memory_order_release );
 	}
 
-	void OnProcessST();
+	void Run( uint32_t count )
+	{
+		std::vector<std::thread> threads;
+		threads.reserve( count );
+		try
+		{
+			while ( count-- )
+				threads.emplace_back( &CWorkerAccumState::OnProcessST, this );
+		}
+		catch ( ... )
+		{
+			Stop();
+			for ( auto& thread : threads )
+				thread.join();
+			throw;
+		}
+		for ( auto& thread : threads )
+			thread.join();
+	}
+
+	void OnProcessST()
+	{
+		CfgProcessor::ComboHandle combo = nullptr;
+		try
+		{
+			while ( !Stopped() )
+			{
+				uint64_t first, count;
+				{
+					std::lock_guard lock{ m_Mutex };
+					if ( m_iNextStatic == m_pEntry->m_numStaticCombos )
+						break;
+					first = m_iNextStatic;
+					count = std::min( StaticCombosPerTask, m_pEntry->m_numStaticCombos - first );
+					m_iNextStatic += count;
+				}
+				const uint64_t begin = m_pEntry->m_iCommandStart + first * m_pEntry->m_numDynamicCombos;
+				const uint64_t end = begin + count * m_pEntry->m_numDynamicCombos;
+				ProcessTask( begin, end, combo );
+			}
+		}
+		catch ( const std::exception& error )
+		{
+			{
+				std::lock_guard lock{ Threading::g_mtxGlobal };
+				ShaderHadErrorDispatchInt( m_pEntry->m_szName );
+			}
+			{
+				std::lock_guard lock{ Threading::g_mtxMsgReport };
+				std::cerr << "\n" << error.what() << std::endl;
+			}
+			StopCommandRange();
+		}
+		Combo_Free( combo );
+	}
 
 	void Stop() noexcept
 	{
@@ -953,289 +1000,140 @@ public:
 	}
 
 private:
-	std::atomic<bool>			m_bBreak;
-	std::atomic<int>			m_nActive;
-	TMutexType					m_Mutex;
+	// Bound the tail of a task while amortizing scheduling over whole static combos.
+	static constexpr uint64_t StaticCombosPerTask = 256;
+	std::atomic<bool> m_bBreak{ false };
+	TMutexType m_Mutex;
+	const CfgProcessor::CfgEntryInfo* m_pEntry = nullptr;
+	uint64_t m_iNextStatic = 0;
+	const uint32_t m_iFlags;
 
-	static void DoExecute( CWorkerAccumState* pThis )
+	bool Stopped() const noexcept
 	{
-		while ( pThis->OnProcess() )
-			continue;
-
-		--pThis->m_nActive;
+		return m_bBreak.load( std::memory_order_acquire ) || g_bInterrupted.load();
 	}
 
-	std::vector<uint64_t>	m_arrSubProcessInfos;
-	uint64_t				m_iFirstCommand;
-	uint64_t				m_iNextCommand;
-	uint64_t				m_iEndCommand;
-
-	uint64_t				m_iLastFinished;
-
-	CfgProcessor::ComboHandle m_hCombo;
-
-	const uint32_t			m_iFlags;
-
-	bool OnProcess();
-	void TryToPackageData( uint64_t iCommandNumber );
-};
-
-static void SkipRestoredCombos( uint64_t& command, CfgProcessor::ComboHandle& combo, uint64_t end )
-{
-	while ( combo )
+	void ProcessTask( uint64_t begin, uint64_t end, CfgProcessor::ComboHandle& combo )
 	{
-		const auto* entry = Combo_GetEntryInfo( combo );
-		const uint64_t id = Combo_GetComboNum( combo ) / entry->m_numDynamicCombos;
-		if ( !g_RestoredStaticCombos.contains( id ) )
-			break;
-		command = entry->m_iCommandStart + ( entry->m_numStaticCombos - id ) * entry->m_numDynamicCombos;
-		Combo_Free( combo );
-		if ( command >= end )
+		bool haveCombo = CfgProcessor::Combo_Seek( begin, combo, end );
+		if ( !haveCombo )
+		{
+			const uint64_t skippedEnd = CfgProcessor::Combo_SkippedRangeEnd( combo );
+			std::lock_guard lock{ m_Mutex };
+			const uint64_t next = m_pEntry->m_iCommandStart + m_iNextStatic * m_pEntry->m_numDynamicCombos;
+			// A true predicate may cover many still-unassigned tasks. Skip only complete statics.
+			if ( skippedEnd > next )
+				m_iNextStatic = std::min( m_pEntry->m_numStaticCombos,
+					( skippedEnd - m_pEntry->m_iCommandStart ) / m_pEntry->m_numDynamicCombos );
 			return;
-		Combo_GetNext( command, combo, end );
-	}
-}
-
-template <typename TMutexType>
-void CWorkerAccumState<TMutexType>::RangeBegin( uint64_t iFirstCommand, uint64_t iEndCommand )
-{
-	m_iFirstCommand = iFirstCommand;
-	m_iNextCommand  = iFirstCommand;
-	m_iEndCommand   = iEndCommand;
-	m_iLastFinished = iFirstCommand;
-	m_hCombo        = nullptr;
-	CfgProcessor::Combo_GetNext( m_iNextCommand, m_hCombo, m_iEndCommand );
-	SkipRestoredCombos( m_iNextCommand, m_hCombo, m_iEndCommand );
-}
-
-template <typename TMutexType>
-void CWorkerAccumState<TMutexType>::RangeFinished()
-{
-	// Finish packaging data
-	TryToPackageData( m_iEndCommand - 1 );
-}
-
-template <typename TMutexType>
-void CWorkerAccumState<TMutexType>::ExecuteCompileCommand( CfgProcessor::ComboHandle hCombo )
-{
-	CmdSink::IResponse* pResponse = nullptr;
-
-	if constexpr ( std::is_same_v<TMutexType, Threading::null_mutex> )
-	{
-		if ( g_bVerbose2 )
-		{
-			char chReadBuf[4096];
-			Combo_FormatCommandHumanReadable( hCombo, chReadBuf );
-			std::cout << "running: \""sv << clr::green << chReadBuf << clr::reset << "\""sv << endLine;
 		}
-	}
-
-	Compiler::ExecuteCommand( Combo_BuildCommand( hCombo ), pResponse, m_iFlags );
-
-	HandleCommandResponse( hCombo, pResponse );
-}
-
-static void StopCommandRange();
-
-template <typename TMutexType>
-void CWorkerAccumState<TMutexType>::HandleCommandResponse( CfgProcessor::ComboHandle hCombo, CmdSink::IResponse* pResponse )
-{
-	Assert( pResponse );
-
-	// Command info
-	const CfgProcessor::CfgEntryInfo* pEntryInfo = Combo_GetEntryInfo( hCombo );
-	const uint64_t iComboIndex                   = Combo_GetComboNum( hCombo );
-	const uint64_t iCommandNumber                = Combo_GetCommandNum( hCombo );
-
-	if ( pResponse->Succeeded() )
-	{
-		std::lock_guard guard{ Threading::g_mtxGlobal };
-		const uint64_t nStComboIdx = iComboIndex / pEntryInfo->m_numDynamicCombos;
-		const uint64_t nDyComboIdx = iComboIndex - ( nStComboIdx * pEntryInfo->m_numDynamicCombos );
-		StaticComboFromDictAdd( pEntryInfo->m_szName, nStComboIdx )->AddDynamicCombo( nDyComboIdx, pResponse->GetResultBuffer(), pResponse->GetResultBufferLen() );
-	}
-	else // Tell the master that this shader failed
-	{
-		std::lock_guard guard{ Threading::g_mtxGlobal };
-		ShaderHadErrorDispatchInt( pEntryInfo->m_szName );
-		g_FailedStaticCombos.insert( iComboIndex / pEntryInfo->m_numDynamicCombos );
-	}
-
-	// Process listing even if the shader succeeds for warnings
-	const char* szListing = pResponse->GetListing();
-	if ( szListing || !pResponse->Succeeded() )
-	{
-		char chUnreportedListing[0xFF];
-		if ( !szListing )
+		std::unique_ptr<CStaticCombo> current;
+		bool failed = false;
+		while ( haveCombo && !Stopped() )
 		{
-			sprintf_s( chUnreportedListing, sizeof( chUnreportedListing ), "%s(0,0): error 0000: Compiler failed without error description. Command number %" PRIu64, pEntryInfo->m_szShaderFileName.data(), iCommandNumber );
-			szListing = chUnreportedListing;
-		}
-
-		char chBuffer[4096];
-		Combo_FormatCommandHumanReadable( hCombo, chBuffer );
-
-		ErrMsgDispatchMsgLine( chBuffer, szListing, pEntryInfo->m_szName );
-		if ( !pResponse->Succeeded() && g_bFastFail )
-			StopCommandRange();
-	}
-
-	pResponse->Release();
-
-	// Maybe zip things up
-	TryToPackageData( iCommandNumber );
-}
-
-template <typename TMutexType>
-void CWorkerAccumState<TMutexType>::TryToPackageData( uint64_t iCommandNumber )
-{
-	std::unique_lock guard{ m_Mutex };
-
-	uint64_t iFinishedByNow = iCommandNumber + 1;
-
-	// Check if somebody is running an earlier command
-	for ( const auto& iRunningCommand : m_arrSubProcessInfos )
-	{
-		if ( iRunningCommand < iCommandNumber )
-		{
-			iFinishedByNow = 0;
-			break;
-		}
-	}
-
-	const uint64_t iLastFinished = m_iLastFinished;
-	if ( iFinishedByNow > m_iLastFinished )
-	{
-		m_iLastFinished = iFinishedByNow;
-		guard.unlock();
-	}
-	else
-		return;
-
-	CfgProcessor::ComboHandle hChBegin = CfgProcessor::Combo_GetCombo( iLastFinished );
-	CfgProcessor::ComboHandle hChEnd   = CfgProcessor::Combo_GetCombo( iFinishedByNow );
-
-	Assert( hChBegin && hChEnd );
-
-	const CfgProcessor::CfgEntryInfo* pInfoBegin = Combo_GetEntryInfo( hChBegin );
-	const CfgProcessor::CfgEntryInfo* pInfoEnd   = Combo_GetEntryInfo( hChEnd );
-
-	uint64_t nComboBegin     = Combo_GetComboNum( hChBegin ) / pInfoBegin->m_numDynamicCombos;
-	const uint64_t nComboEnd = Combo_GetComboNum( hChEnd ) / pInfoEnd->m_numDynamicCombos;
-
-	for ( ; pInfoBegin && ( pInfoBegin->m_iCommandStart < pInfoEnd->m_iCommandStart || nComboBegin > nComboEnd ); )
-	{
-		// Zip this combo
-		CUtlBuffer mbPacked;
-		const size_t nPackedLength = AssembleWorkerReplyPackage( pInfoBegin, nComboBegin, mbPacked );
-
-		if ( nPackedLength )
-		{
-			// Packed buffer
-			uint8_t* pCodeBuffer;
+			const uint64_t id = Combo_GetComboNum( combo ) / m_pEntry->m_numDynamicCombos;
+			if ( current && current->ComboId() != id )
+				PackageData( current, failed );
+			if ( Stopped() )
+				break;
+			if ( g_RestoredStaticCombos.contains( id ) )
 			{
-				std::lock_guard guard{ Threading::g_mtxGlobal };
-				pCodeBuffer = StaticComboFromDictAdd( pInfoBegin->m_szName, nComboBegin )->AllocPackedCodeBlock( nPackedLength );
+				const uint64_t next = m_pEntry->m_iCommandStart + ( m_pEntry->m_numStaticCombos - id ) * m_pEntry->m_numDynamicCombos;
+				haveCombo = CfgProcessor::Combo_Seek( next, combo, end );
+				continue;
 			}
-
-			if ( pCodeBuffer )
+			if ( !current )
 			{
-				mbPacked.SeekGet( CUtlBuffer::SEEK_HEAD, 0 );
-				mbPacked.Get( pCodeBuffer, gsl::narrow<int>( nPackedLength ) );
-				bool failed;
-				{
-					std::lock_guard lock{ Threading::g_mtxGlobal };
-					failed = g_FailedStaticCombos.contains( nComboBegin );
-				}
-				if ( g_ResumeJournal && !failed )
-				{
-					try { g_ResumeJournal->Append( nComboBegin, pCodeBuffer, nPackedLength ); }
-					catch ( const std::exception& error )
-					{
-						{
-							std::lock_guard lock{ Threading::g_mtxGlobal };
-							ShaderHadErrorDispatchInt( pInfoBegin->m_szName );
-						}
-						{
-							std::lock_guard lock{ Threading::g_mtxMsgReport };
-							std::cerr << "\n" << error.what() << std::endl;
-						}
-						StopCommandRange();
-					}
-				}
+				current = std::make_unique<CStaticCombo>( id );
+				failed = false;
+			}
+			ExecuteCompileCommand( combo, *current, failed );
+			if ( Stopped() )
+				break;
+			haveCombo = CfgProcessor::Combo_NextInRange( combo, end );
+		}
+		// Interrupted static combos are discarded rather than checkpointing partial data.
+		if ( !Stopped() )
+			PackageData( current, failed );
+	}
+
+	void ExecuteCompileCommand( CfgProcessor::ComboHandle combo, CStaticCombo& current, bool& failed )
+	{
+		if constexpr ( std::is_same_v<TMutexType, Threading::null_mutex> )
+		{
+			if ( g_bVerbose2 )
+			{
+				char command[4096];
+				Combo_FormatCommandHumanReadable( combo, command );
+				std::cout << "running: \""sv << clr::green << command << clr::reset << "\""sv << endLine;
 			}
 		}
-
-		// Next iteration
-		if ( !nComboBegin-- )
-		{
-			Combo_Free( hChBegin );
-			if ( ( hChBegin = CfgProcessor::Combo_GetCombo( pInfoBegin->m_iCommandEnd ) ) != nullptr )
-			{
-				pInfoBegin  = Combo_GetEntryInfo( hChBegin );
-				nComboBegin = pInfoBegin->m_numStaticCombos - 1;
-			}
-		}
-	}
-
-	Combo_Free( hChBegin );
-	Combo_Free( hChEnd );
-}
-
-template <typename TMutexType>
-bool CWorkerAccumState<TMutexType>::OnProcess()
-{
-	CfgProcessor::ComboHandle hThreadCombo;
-	uint64_t* iCurrentId;
-	{
-		std::lock_guard guard{ m_Mutex };
-		hThreadCombo = m_hCombo ? Combo_Alloc( m_hCombo ) : nullptr;
-		m_arrSubProcessInfos.resize( m_arrSubProcessInfos.size() + 1 );
-		iCurrentId = &m_arrSubProcessInfos.back();
-	}
-
-	uint64_t iThreadCommand = ~0ULL;
-
-	for ( ;; )
-	{
-		{
-			std::lock_guard guard{ m_Mutex };
-			if ( m_hCombo )
-			{
-				Combo_Assign( hThreadCombo, m_hCombo );
-				*iCurrentId = Combo_GetCommandNum( hThreadCombo );
-				Combo_GetNext( iThreadCommand, m_hCombo, m_iEndCommand );
-				SkipRestoredCombos( iThreadCommand, m_hCombo, m_iEndCommand );
-			}
-			else
-			{
-				Combo_Free( hThreadCombo );
-				iThreadCommand = ~0ULL;
-				*iCurrentId = ~0ULL;
-			}
-		}
-
-		if ( hThreadCombo && !m_bBreak.load( std::memory_order_acquire ) && !g_bInterrupted.load() )
-			ExecuteCompileCommand( hThreadCombo );
+		CmdSink::IResponse* rawResponse = nullptr;
+		Compiler::ExecuteCommand( Combo_BuildCommand( combo ), rawResponse, m_iFlags );
+		const auto release = []( CmdSink::IResponse* response ) { if ( response ) response->Release(); };
+		std::unique_ptr<CmdSink::IResponse, decltype( release )> response( rawResponse, release );
+		if ( !response )
+			throw std::runtime_error( "Compiler returned no response" );
+		const uint64_t index = Combo_GetComboNum( combo );
+		if ( response->Succeeded() )
+			current.AddDynamicCombo( index % m_pEntry->m_numDynamicCombos, response->GetResultBuffer(), response->GetResultBufferLen() );
 		else
-			break;
+		{
+			failed = true;
+			std::lock_guard lock{ Threading::g_mtxGlobal };
+			ShaderHadErrorDispatchInt( m_pEntry->m_szName );
+		}
+		const char* listing = response->GetListing();
+		if ( listing || !response->Succeeded() )
+		{
+			char fallback[255];
+			if ( !listing )
+			{
+				sprintf_s( fallback, sizeof( fallback ), "%s(0,0): error 0000: Compiler failed without error description. Command number %" PRIu64,
+					m_pEntry->m_szShaderFileName.data(), Combo_GetCommandNum( combo ) );
+				listing = fallback;
+			}
+			char command[4096];
+			Combo_FormatCommandHumanReadable( combo, command );
+			ErrMsgDispatchMsgLine( command, listing, m_pEntry->m_szName );
+			if ( !response->Succeeded() && g_bFastFail )
+				StopCommandRange();
+		}
 	}
 
-	Combo_Free( hThreadCombo );
-	return false;
-}
-
-template <typename TMutexType>
-void CWorkerAccumState<TMutexType>::OnProcessST()
-{
-	while ( m_hCombo && !m_bBreak.load( std::memory_order_acquire ) && !g_bInterrupted.load() )
+	void PackageData( std::unique_ptr<CStaticCombo>& current, bool failed )
 	{
-		ExecuteCompileCommand( m_hCombo );
-
-		Combo_GetNext( m_iNextCommand, m_hCombo, m_iEndCommand );
-		SkipRestoredCombos( m_iNextCommand, m_hCombo, m_iEndCommand );
+		if ( !current )
+			return;
+		if ( current->DynamicCombos().empty() )
+		{
+			current.reset();
+			return;
+		}
+		const uint64_t id = current->ComboId();
+		{
+			std::lock_guard lock{ Threading::g_mtxGlobal };
+			auto*& blocks = g_ShaderByteCode[m_pEntry->m_szName];
+			if ( !blocks )
+				blocks = new StaticComboNodeHash_t;
+			if ( !blocks->try_emplace( id, std::move( current ) ).second )
+				throw std::runtime_error( "Static combo was packaged more than once" );
+		}
+		CUtlBuffer packed;
+		const size_t length = AssembleWorkerReplyPackage( m_pEntry, id, packed );
+		if ( !length )
+			return;
+		uint8_t* destination;
+		{
+			std::lock_guard lock{ Threading::g_mtxGlobal };
+			destination = StaticComboFromDictAdd( m_pEntry->m_szName, id )->AllocPackedCodeBlock( length );
+		}
+		packed.SeekGet( CUtlBuffer::SEEK_HEAD, 0 );
+		packed.Get( destination, gsl::narrow<int>( length ) );
+		if ( g_ResumeJournal && !failed )
+			g_ResumeJournal->Append( id, destination, length );
 	}
-}
+};
 
 //
 // ProcessCommandRange_Singleton
@@ -1265,7 +1163,7 @@ public:
 	}
 
 public:
-	void ProcessCommandRange( uint64_t shaderStart, uint64_t shaderEnd );
+	void ProcessCommandRange( const CfgProcessor::CfgEntryInfo* entry );
 
 	void Stop();
 	bool Stoped() const { return m_bStopped.load() || g_bInterrupted.load(); }
@@ -1324,22 +1222,20 @@ void ProcessCommandRange_Singleton::Stop()
 		m_ST->Stop();
 }
 
-void ProcessCommandRange_Singleton::ProcessCommandRange( uint64_t shaderStart, uint64_t shaderEnd )
+void ProcessCommandRange_Singleton::ProcessCommandRange( const CfgProcessor::CfgEntryInfo* entry )
 {
+	Compiler::ClearCompileCache();
 	if ( m_nThreads > 1 )
 	{
-		m_MT->RangeBegin( shaderStart, shaderEnd );
+		m_MT->RangeBegin( entry );
 		m_MT->Run( m_nThreads );
-		if ( !Stoped() )
-			m_MT->RangeFinished();
 	}
 	else
 	{
-		m_ST->RangeBegin( shaderStart, shaderEnd );
+		m_ST->RangeBegin( entry );
 		m_ST->OnProcessST();
-		if ( !Stoped() )
-			m_ST->RangeFinished();
 	}
+	Compiler::ClearCompileCache();
 }
 
 static void Shader_ParseShaderInfoFromCompileCommands( const CfgProcessor::CfgEntryInfo* pEntry, ShaderInfo_t& shaderInfo )
@@ -1478,7 +1374,6 @@ static void CompileShaders( std::unique_ptr<CfgProcessor::CfgEntryInfo[]> arrEnt
 		auto cacheLock = std::make_unique<ResumeLock>( lockPath );
 		fs::path completedJournal;
 		g_RestoredStaticCombos.clear();
-		g_FailedStaticCombos.clear();
 		g_ResumeJournal.reset();
 		if ( g_bInterrupted.load() )
 			break;
@@ -1496,7 +1391,11 @@ static void CompileShaders( std::unique_ptr<CfgProcessor::CfgEntryInfo[]> arrEnt
 			std::cout << "\nResume: " << pEntry->m_szName << ": " << g_RestoredStaticCombos.size()
 				<< " completed static combos restored; cache " << completedJournal << std::endl;
 		}
-		pcr.ProcessCommandRange( pEntry->m_iCommandStart, pEntry->m_iCommandEnd );
+		Compiler::BeginPreprocessCacheRange();
+		pcr.ProcessCommandRange( pEntry );
+		Compiler::EndPreprocessCacheRange();
+		if ( g_ResumeJournal )
+			g_ResumeJournal->Flush();
 		g_ResumeJournal.reset();
 
 		if ( pcr.Stoped() )
@@ -1761,7 +1660,9 @@ int main( int argc, const char* argv[] )
 	}
 
 	cmdLine.add( "", false, 0, 0, "Disable static-combo checkpoint and recovery", "-noresume", "/noresume" );
+	cmdLine.add( "", false, 0, 0, "Disable reuse of identical preprocessed shaders", "-no-preprocess-cache" );
 	cmdLine.parse( argc, argv );
+	Compiler::SetPreprocessCacheEnabled( !cmdLine.isSet( "-no-preprocess-cache" ) );
 
 	if ( cmdLine.isSet( "-help" ) )
 	{

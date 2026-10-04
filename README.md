@@ -14,6 +14,7 @@ ShaderCompile.exe [OPTIONS] -ver n -shaderdir src_dir shader.fxc
 -force                         Skip crc check during compilation
 -threads ARG                   Number of threads used, defaults to core count
 -noresume                      Disable partial static-combo checkpoints
+-no-preprocess-cache           Disable reuse of identical preprocessed shaders
 
 -h, -help                      Shows help
 -verbose                       Verbose file cache and final shader info

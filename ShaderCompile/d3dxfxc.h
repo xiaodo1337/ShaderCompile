@@ -12,6 +12,8 @@
 #include "cmdsink.h"
 
 #include "robin_hood.h"
+#include <string>
+#include <vector>
 
 class CSharedFile final : private std::vector<char>
 {
@@ -22,6 +24,10 @@ public:
 
 	[[nodiscard]] const void* Data() const noexcept { return data(); }
 	[[nodiscard]] size_t Size() const noexcept { return size(); }
+	[[nodiscard]] bool CacheSafe() const noexcept { return m_bCacheSafe; }
+
+private:
+	bool m_bCacheSafe = true;
 };
 
 class FileCache final
@@ -50,5 +56,10 @@ namespace CfgProcessor
 
 namespace Compiler
 {
+	// Cache configuration and lifecycle are controlled between shader ranges.
+	void SetPreprocessCacheEnabled( bool enabled );
+	void BeginPreprocessCacheRange();
+	void EndPreprocessCacheRange();
+	void ClearCompileCache();
 	void ExecuteCommand( const CfgProcessor::ComboBuildCommand& pCommand, CmdSink::IResponse* &ppResponse, unsigned int flags );
 }; // namespace InterceptFxc

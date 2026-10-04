@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -70,6 +71,12 @@ public:
 			throw std::runtime_error( "Cannot append shader resume journal" );
 	}
 
+	void Flush()
+	{
+		std::lock_guard guard{ m_Mutex };
+		FlushUnlocked();
+	}
+
 	void Append( uint64_t id, const void* data, size_t size )
 	{
 		if ( !size || size > MaxBlockSize )
@@ -81,9 +88,11 @@ public:
 		Write( m_Output, length );
 		Write( m_Output, crc );
 		m_Output.write( static_cast<const char*>( data ), static_cast<std::streamsize>( size ) );
-		m_Output.flush();
+		m_BufferedBytes += size + sizeof( id ) + sizeof( length ) + sizeof( crc );
 		if ( !m_Output )
 			throw std::runtime_error( "Shader resume journal write failed (check free disk space)" );
+		if ( m_BufferedBytes >= 1024 * 1024 || std::chrono::steady_clock::now() - m_LastFlush >= std::chrono::seconds( 1 ) )
+			FlushUnlocked();
 	}
 
 private:
@@ -91,6 +100,17 @@ private:
 	static constexpr uint64_t MaxBlockSize = 256ULL * 1024 * 1024;
 	std::ofstream m_Output;
 	std::mutex m_Mutex;
+	size_t m_BufferedBytes = 0;
+	std::chrono::steady_clock::time_point m_LastFlush = std::chrono::steady_clock::now();
+
+	void FlushUnlocked()
+	{
+		m_Output.flush();
+		if ( !m_Output )
+			throw std::runtime_error( "Shader resume journal write failed (check free disk space)" );
+		m_BufferedBytes = 0;
+		m_LastFlush = std::chrono::steady_clock::now();
+	}
 
 	template <typename T> static bool Read( std::istream& input, T& value )
 	{

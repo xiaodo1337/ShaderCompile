@@ -18,11 +18,14 @@
 
 #include "utlbuffer.h"
 #include <algorithm>
+#include <array>
 #include <charconv>
+#include <cctype>
 #include <cstdarg>
 #include <ctime>
 #include <filesystem>
 #include <map>
+#include <limits>
 #include <numeric>
 #include <set>
 #include <string>
@@ -85,6 +88,7 @@ public:
 	virtual int GetVariableValue( int nSlot ) const noexcept						= 0;
 	virtual const std::string& GetVariableName( int nSlot ) const noexcept			= 0;
 	virtual int GetVariableSlot( const std::string& szVariableName ) const noexcept	= 0;
+	virtual bool IsVariableConstant( int nSlot ) const noexcept = 0;
 };
 
 class IExpression
@@ -388,6 +392,8 @@ public:
 
 	void Parse( std::string szExpression );
 	void Clear() noexcept;
+	bool Parsed() const noexcept { return m_pRoot && m_pRoot != m_pDefFalse; }
+	int FirstVariableSlot() const noexcept { return m_nFirstVariableSlot; }
 
 public:
 	EVAL { return m_pRoot ? m_pRoot->Evaluate( pCtx ? pCtx : m_pContext ) : 0; }
@@ -428,6 +434,7 @@ protected:
 	IEvaluationContext* m_pContext;
 
 	IExpression* m_pDefFalse;
+	int m_nFirstVariableSlot = std::numeric_limits<int>::max();
 };
 
 #undef BEGIN_EXPR_UNARY
@@ -446,6 +453,7 @@ protected:
 void CComplexExpression::Parse( std::string szExpression )
 {
 	Clear();
+	m_nFirstVariableSlot = std::numeric_limits<int>::max();
 
 	m_pDefFalse = Expression<CExprConstant>( 0 );
 
@@ -577,7 +585,9 @@ IExpression* CComplexExpression::ParseInternal( char* &szExpression )
 	else if ( !strncmp( szExpression, "defined", 7 ) )
 	{
 		szExpression += 7;
+		const int firstSlot = m_nFirstVariableSlot;
 		IExpression* pNext = ParseInternal( szExpression );
+		m_nFirstVariableSlot = firstSlot; // defined is evaluated once while parsing.
 		return Expression<CExprConstant>( pNext->Evaluate( m_pContext ) );
 	}
 	else if ( *szExpression == '(' )
@@ -612,6 +622,8 @@ IExpression* CComplexExpression::ParseInternal( char* &szExpression )
 	parsed_variable_name:
 		const int nSlot = m_pContext->GetVariableSlot( std::string( szExpression + 1, lenVariable ) );
 		szExpression += lenVariable + 1;
+		if ( nSlot >= 0 && !m_pContext->IsVariableConstant( nSlot ) )
+			m_nFirstVariableSlot = std::min( m_nFirstVariableSlot, nSlot );
 
 		return Expression<CExprVariable>( nSlot );
 	}
@@ -661,6 +673,7 @@ public:
 	// IEvaluationContext
 public:
 	[[nodiscard]] int GetVariableValue( int nSlot ) const noexcept override { return m_arrVarSlots[nSlot]; }
+	bool IsVariableConstant( int nSlot ) const noexcept override { return m_arrDefines[nSlot].Min() == m_arrDefines[nSlot].Max(); }
 	[[nodiscard]] const std::string& GetVariableName( int nSlot ) const noexcept override { return m_arrDefines[nSlot].Name(); }
 	[[nodiscard]] int GetVariableSlot( const std::string& szVariableName ) const noexcept override
 	{
@@ -714,6 +727,14 @@ public:
 	std::unique_ptr<ComboGenerator> m_pCg;
 	std::unique_ptr<CComplexExpression> m_pExpr;
 
+	struct SkipRule
+	{
+		std::unique_ptr<CComplexExpression> expression;
+		uint64_t span;
+	};
+	std::vector<SkipRule> m_skipRules;
+	std::string m_shaderModelDefine;
+
 	CfgProcessor::CfgEntryInfo m_eiInfo;
 };
 
@@ -735,19 +756,28 @@ public:
 	// IEvaluationContext
 private:
 	std::vector<int> m_arrVarSlots;
+	struct SkipCache
+	{
+		uint64_t first = 1, last = 0;
+		bool skipped = false;
+	};
+	mutable std::vector<SkipCache> m_skipCache;
 
 public:
 	int GetVariableValue( int nSlot ) const noexcept override { return m_arrVarSlots[nSlot]; }
+	bool IsVariableConstant( int nSlot ) const noexcept override { return m_pEntry->m_pCg->IsVariableConstant( nSlot ); }
 	const std::string& GetVariableName( int nSlot ) const noexcept override { return m_pEntry->m_pCg->GetVariableName( nSlot ); }
 	int GetVariableSlot( const std::string& szVariableName ) const noexcept override { return m_pEntry->m_pCg->GetVariableSlot( szVariableName ); }
 
 	// External implementation
 public:
 	bool Initialize( uint64_t iTotalCommand, const CfgEntry* pEntry );
+	void ResetFrom( const ComboHandleImpl& seed );
 	bool AdvanceCommands( uint64_t& riAdvanceMore ) noexcept;
 	bool NextNotSkipped( uint64_t iTotalCommand ) noexcept;
-	bool IsSkipped() const noexcept { return m_pEntry->m_pExpr->Evaluate( this ) != 0; }
-	CfgProcessor::ComboBuildCommand BuildCommand() const;
+	uint64_t SkipAdvance() const noexcept;
+	bool IsSkipped() const noexcept { return SkipAdvance() != 0; }
+	const CfgProcessor::ComboBuildCommand& BuildCommand() const;
 	void FormatCommandHumanReadable( gsl::span<char> pchBuffer ) const;
 };
 
@@ -767,8 +797,20 @@ bool ComboHandleImpl::Initialize( uint64_t iTotalCommand, const CfgEntry* pEntry
 	for ( const Define* pSetDef = pDefVars; pSetDef < pDefVarsEnd; ++pSetDef )
 		m_arrVarSlots.emplace_back( pSetDef->Max() );
 
+	m_skipCache.resize( m_pEntry->m_skipRules.size() );
 	m_iComboNumber = m_numCombos - 1;
 	return true;
+}
+
+void ComboHandleImpl::ResetFrom( const ComboHandleImpl& seed )
+{
+	if ( m_pEntry != seed.m_pEntry )
+		m_skipCache = seed.m_skipCache;
+	m_iTotalCommand = seed.m_iTotalCommand;
+	m_iComboNumber = seed.m_iComboNumber;
+	m_numCombos = seed.m_numCombos;
+	m_pEntry = seed.m_pEntry;
+	m_arrVarSlots = seed.m_arrVarSlots;
 }
 
 bool ComboHandleImpl::AdvanceCommands( uint64_t& riAdvanceMore ) noexcept
@@ -794,6 +836,17 @@ bool ComboHandleImpl::AdvanceCommands( uint64_t& riAdvanceMore ) noexcept
 	// Do the advance
 	m_iTotalCommand += riAdvanceMore;
 	m_iComboNumber -= riAdvanceMore;
+	if ( riAdvanceMore == 1 )
+	{
+		for ( pSetValues = pnValues, pSetDef = pDefVars; pSetValues < pnValuesEnd; ++pSetValues, ++pSetDef )
+		{
+			if ( --*pSetValues >= pSetDef->Min() )
+				break;
+			*pSetValues = pSetDef->Max();
+		}
+		riAdvanceMore = 0;
+		return true;
+	}
 	for ( pSetValues = pnValues, pSetDef = pDefVars; ( pSetValues < pnValuesEnd ) && ( riAdvanceMore > 0 ); ++pSetValues, ++pSetDef )
 	{
 		riAdvanceMore += ( static_cast<uint64_t>( pSetDef->Max() ) - *pSetValues );
@@ -807,83 +860,99 @@ bool ComboHandleImpl::AdvanceCommands( uint64_t& riAdvanceMore ) noexcept
 	return true;
 }
 
+uint64_t ComboHandleImpl::SkipAdvance() const noexcept
+{
+	for ( size_t i = 0; i < m_pEntry->m_skipRules.size(); ++i )
+	{
+		const auto& rule = m_pEntry->m_skipRules[i];
+		auto& cache = m_skipCache[i];
+		if ( m_iComboNumber < cache.first || m_iComboNumber > cache.last )
+		{
+			cache.first = m_iComboNumber - m_iComboNumber % rule.span;
+			cache.last = cache.first + rule.span - 1;
+			cache.skipped = rule.expression->Evaluate( this ) != 0;
+		}
+		if ( cache.skipped )
+			return m_iComboNumber - cache.first + 1;
+	}
+	return 0;
+}
+
 bool ComboHandleImpl::NextNotSkipped( uint64_t iTotalCommand ) noexcept
 {
-	// Get the pointers
-	int* const pnValues    = m_arrVarSlots.data();
-	int* const pnValuesEnd = pnValues + m_arrVarSlots.size();
-	int* pSetValues;
-
-	// Defines
-	const Define* const pDefVars = m_pEntry->m_pCg->GetDefinesBase();
-	const Define* pSetDef;
-
-	// Go ahead and run the iterations
-next_combo_iteration:
-	if ( m_iTotalCommand + 1 >= iTotalCommand || !m_iComboNumber )
-		return false;
-
-	--m_iComboNumber;
-	++m_iTotalCommand;
-
-	// Do a next iteration
-	for ( pSetValues = pnValues, pSetDef = pDefVars; pSetValues < pnValuesEnd; ++pSetValues, ++pSetDef )
+	uint64_t advance = 1;
+	for ( ;; )
 	{
-		if ( --*pSetValues >= pSetDef->Min() )
-			goto have_combo_iteration;
+		if ( m_iTotalCommand + 1 >= iTotalCommand || !m_iComboNumber )
+			return false;
 
-		*pSetValues = pSetDef->Max();
+		uint64_t remaining = std::min( m_iComboNumber, iTotalCommand - m_iTotalCommand - 1 );
+		if ( advance > remaining )
+		{
+			AdvanceCommands( remaining );
+			return false;
+		}
+		AdvanceCommands( advance );
+		advance = SkipAdvance();
+		if ( !advance )
+			return true;
 	}
-
-	return false;
-
-have_combo_iteration:
-	if ( m_pEntry->m_pExpr->Evaluate( this ) )
-		goto next_combo_iteration;
-
-	return true;
 }
 
-static thread_local robin_hood::unordered_node_set<std::string> s_tlPool;
-template <typename T>
-static std::string_view String( const T& str )
+static void SetupSkipRules( CfgEntry& cfg, const std::vector<std::string>& skips )
 {
-	return *s_tlPool.emplace( str ).first;
+	// Preserve the original behavior if the combined expression did not parse.
+	if ( !cfg.m_pExpr->Parsed() )
+		return;
+	for ( const auto& skip : skips )
+	{
+		auto expression = std::make_unique<CComplexExpression>( cfg.m_pCg.get() );
+		expression->Parse( skip );
+		uint64_t span = 1;
+		const Define* defines = cfg.m_pCg->GetDefinesBase();
+		for ( size_t slot = 0; slot < cfg.m_pCg->DefineCount() && slot < static_cast<size_t>( expression->FirstVariableSlot() ); ++slot )
+			span *= static_cast<uint64_t>( defines[slot].Max() ) - defines[slot].Min() + 1;
+		cfg.m_skipRules.push_back( { std::move( expression ), span } );
+	}
+	// Test conditions that can skip the largest unchanged block first.
+	std::stable_sort( cfg.m_skipRules.begin(), cfg.m_skipRules.end(),
+		[]( const auto& a, const auto& b ) { return a.span > b.span; } );
 }
 
-CfgProcessor::ComboBuildCommand ComboHandleImpl::BuildCommand() const
+const CfgProcessor::ComboBuildCommand& ComboHandleImpl::BuildCommand() const
 {
-	// Get the pointers
-	const int* const pnValues    = m_arrVarSlots.data();
-	const int* const pnValuesEnd = pnValues + m_arrVarSlots.size();
-	const int* pSetValues;
-
-	// Defines
-	const Define* const pDefVars = m_pEntry->m_pCg->GetDefinesBase();
-	const Define* const pDefVarsEnd = m_pEntry->m_pCg->GetDefinesEnd();
-	const Define* pSetDef;
-
-	CfgProcessor::ComboBuildCommand command{ m_pEntry->m_eiInfo.m_szEntryPoint, m_pEntry->m_szShaderSrc, m_pEntry->m_eiInfo.m_szShaderVersion };
-	command.defines.reserve( m_pEntry->m_pCg->DefineCount() + 2 );
-
-	char tmpBuf[24]{};
-	std::to_chars( std::begin( tmpBuf ), std::end( tmpBuf ), m_iComboNumber, 16 );
-
-	command.defines.emplace_back( "SHADERCOMBO", String( tmpBuf ) );
-
-	char version[16];
-	strcpy_s( version, sizeof( version ), m_pEntry->m_eiInfo.m_szShaderVersion.data() );
-	_strupr_s( version );
-	sprintf_s( tmpBuf, sizeof( tmpBuf ), "SHADER_MODEL_%6.6s", version );
-
-	command.defines.emplace_back( String( tmpBuf ), "1" );
-
-	for ( pSetValues = pnValues, pSetDef = pDefVars; pSetValues < pnValuesEnd && pDefVars < pDefVarsEnd; ++pSetValues, ++pSetDef )
+	static thread_local CfgProcessor::ComboBuildCommand command;
+	static thread_local std::vector<std::array<char, 24>> values;
+	static thread_local std::vector<int> previousValues;
+	static thread_local const CfgEntry* previousEntry = nullptr;
+	const size_t count = m_pEntry->m_pCg->DefineCount();
+	const Define* defines = m_pEntry->m_pCg->GetDefinesBase();
+	const bool changedEntry = previousEntry != m_pEntry;
+	if ( changedEntry )
 	{
-		*std::to_chars( std::begin( tmpBuf ), std::end( tmpBuf ), *pSetValues ).ptr = 0;
-		command.defines.emplace_back( pSetDef->Name(), String( tmpBuf ) );
+		values.resize( count + 1 );
+		previousValues.resize( count );
+		command.defines.resize( count + 2 );
+		command.entryPoint = m_pEntry->m_eiInfo.m_szEntryPoint;
+		command.fileName = m_pEntry->m_szShaderSrc;
+		command.shaderModel = m_pEntry->m_eiInfo.m_szShaderVersion;
+		command.defines[0] = { "SHADERCOMBO", values[0].data() };
+		command.defines[1] = { m_pEntry->m_shaderModelDefine, "1" };
+		for ( size_t slot = 0; slot < count; ++slot )
+			command.defines[slot + 2] = { defines[slot].Name(), values[slot + 1].data() };
+		previousEntry = m_pEntry;
 	}
-
+	auto& comboValue = values[0];
+	*std::to_chars( comboValue.data(), comboValue.data() + comboValue.size(), m_iComboNumber, 16 ).ptr = 0;
+	for ( size_t slot = 0; slot < count; ++slot )
+	{
+		if ( changedEntry || previousValues[slot] != m_arrVarSlots[slot] )
+		{
+			auto& value = values[slot + 1];
+			*std::to_chars( value.data(), value.data() + value.size(), m_arrVarSlots[slot] ).ptr = 0;
+			previousValues[slot] = m_arrVarSlots[slot];
+		}
+	}
 	return command;
 }
 
@@ -963,6 +1032,7 @@ static void SetupConfiguration( const std::vector<CfgProcessor::ShaderConfig>& c
 		AddCombos( cg, conf.dynamic_c, false );
 		AddCombos( cg, conf.static_c, true );
 		exprSkip.Parse( ( std::accumulate( conf.skip.begin(), conf.skip.end(), "("s, []( const std::string& s, const std::string& sk ) { return s + sk + ")||("; } ) + "0)" ) );
+		SetupSkipRules( cfg, conf.skip );
 
 		baseTemplate[0] = conf.target[0];
 		baseTemplate[3] = conf.version[0];
@@ -972,6 +1042,9 @@ static void SetupConfiguration( const std::vector<CfgProcessor::ShaderConfig>& c
 		info.m_szName = cfg.m_szName;
 		info.m_szShaderFileName = cfg.m_szShaderSrc;
 		info.m_szShaderVersion = *s_strPool.emplace( baseTemplate ).first;
+		cfg.m_shaderModelDefine = "SHADER_MODEL_" + std::string( info.m_szShaderVersion );
+		std::transform( cfg.m_shaderModelDefine.begin(), cfg.m_shaderModelDefine.end(), cfg.m_shaderModelDefine.begin(),
+			[]( unsigned char ch ) { return static_cast<char>( std::toupper( ch ) ); } );
 		info.m_szEntryPoint = *s_strPool.emplace( conf.main ).first;
 		info.m_numCombos = cg.NumCombos();
 		info.m_numDynamicCombos = cg.NumCombos( false );
@@ -1127,6 +1200,46 @@ ComboHandle Combo_GetCombo( uint64_t iCommandNumber )
 	return AsHandle( pImpl );
 }
 
+bool Combo_Seek( uint64_t command, ComboHandle& combo, uint64_t end )
+{
+	if ( command >= end )
+		return false;
+	uint64_t found = command;
+	const CPCHI_t empty;
+	const auto& seed = GetLessOrEq( found, empty );
+	if ( !seed.m_pEntry || !seed.m_pEntry->m_pCg || !seed.m_pEntry->m_pExpr ||
+		command < found || command >= seed.m_pEntry->m_eiInfo.m_iCommandEnd )
+		return false;
+	CPCHI_t* impl = FromHandle( combo );
+	if ( impl )
+		impl->ResetFrom( seed );
+	else
+	{
+		impl = new CPCHI_t( seed );
+		combo = AsHandle( impl );
+	}
+	uint64_t advance = command - found;
+	if ( !impl->AdvanceCommands( advance ) )
+		return false;
+	return !impl->IsSkipped() || impl->NextNotSkipped( std::min( end, seed.m_pEntry->m_eiInfo.m_iCommandEnd ) );
+}
+
+bool Combo_NextInRange( ComboHandle combo, uint64_t end ) noexcept
+{
+	const auto impl = FromHandle( combo );
+	return impl && impl->m_pEntry && impl->m_pEntry->m_pCg &&
+		impl->NextNotSkipped( std::min( end, impl->m_pEntry->m_eiInfo.m_iCommandEnd ) );
+}
+
+uint64_t Combo_SkippedRangeEnd( ComboHandle combo ) noexcept
+{
+	const auto impl = FromHandle( combo );
+	if ( !impl || !impl->m_pEntry || !impl->m_pEntry->m_pCg )
+		return 0;
+	const uint64_t advance = impl->SkipAdvance();
+	return advance ? impl->m_iTotalCommand + advance : 0;
+}
+
 void Combo_GetNext( uint64_t& riCommandNumber, ComboHandle& rhCombo, uint64_t iCommandEnd )
 {
 	// Combo handle implementation
@@ -1195,7 +1308,7 @@ void Combo_GetNext( uint64_t& riCommandNumber, ComboHandle& rhCombo, uint64_t iC
 	}
 }
 
-ComboBuildCommand Combo_BuildCommand( ComboHandle hCombo )
+const ComboBuildCommand& Combo_BuildCommand( ComboHandle hCombo )
 {
 	const auto pImpl = FromHandle( hCombo );
 	return pImpl->BuildCommand();
